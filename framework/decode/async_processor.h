@@ -173,7 +173,6 @@ class AsyncProcessor
     // which should be safely within the last level cache sizes of all platforms of interest.
     constexpr static BatchCount kLowWater             = 1; // Flush current batch if not this many batches queued
     constexpr static BatchCount kSoftLowWater         = 2; // Flush current batch if more than half full
-    constexpr static BatchCount kAsyncDecompressNever = 4; // Offload decompression to dispatch when below this limit
     constexpr static BatchCount kAsyncDecompressOptimized = 8;  // Do decompression of smaller blocks on async_thread_
     constexpr static BatchCount kAsyncDecompressAlways    = 16; // Do all decompression on async_thread_
 
@@ -184,7 +183,6 @@ class AsyncProcessor
 
     void WaitForBatchCount(BatchCount wait_target);
     void ThrottleQueue();
-    void AdjustDecompressionPolicy(BatchCount pending_batches);
 
     void AddResultsBlock(const file_processor::ProcessBlocksResult& result);
     void AddContinueBatch();
