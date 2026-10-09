@@ -2039,7 +2039,8 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
                 GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, memory_alloc_info->allocation_size);
                 size_t allocation_size = static_cast<size_t>(memory_alloc_info->allocation_size);
 
-                memory_alloc_info->original_content = std::make_unique<uint8_t[]>(allocation_size);
+                // calloc returns lazily zeroed pages for large sizes, so only the ranges that get written are touched
+                memory_alloc_info->original_content.reset(static_cast<uint8_t*>(calloc(allocation_size, 1)));
             }
 
             // Update the reconstructed memory, which is written to memory allocations created at resource bind to

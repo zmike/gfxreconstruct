@@ -391,6 +391,11 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     friend VKAPI_ATTR void VKAPI_CALL
     OnVmaFreeDeviceMemory(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*);
 
+    struct ZeroedBufferDeleter
+    {
+        void operator()(uint8_t* ptr) const { free(ptr); }
+    };
+
     struct MemoryAllocInfo;
 
     struct SubresourceLayouts
@@ -524,7 +529,7 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
         VmaMemoryInfo*                                   imported_mem_info{ nullptr };
         VkBuffer                                         import_dedicated_buffer{ VK_NULL_HANDLE };
         VkImage                                          import_dedicated_image{ VK_NULL_HANDLE };
-        std::unique_ptr<uint8_t[]>                       original_content;
+        std::unique_ptr<uint8_t[], ZeroedBufferDeleter>  original_content;
         std::unordered_map<uint64_t, ResourceAllocInfo*> original_objects; // Key is object handle.
 
         std::vector<std::unique_ptr<VmaMemoryInfo>> vma_mem_infos;
