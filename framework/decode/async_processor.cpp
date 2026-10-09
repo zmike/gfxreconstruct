@@ -124,13 +124,6 @@ void AsyncProcessor::ThrottleQueue()
             allocator.FlushBatch();
             async_stats_.AddLowWaterFlush(enqueued_frame_index_, enqueued_batch_index_, pending_batches);
         }
-
-        // Whether we flush or not, need to attempt to improve load balance by shifting decompression to
-        // the consumer.
-        static_assert(kSoftLowWater <= kAsyncDecompressNever,
-                      "Must stay compatible with AdjustDecompressionPolicy threshold.");
-        async_stats_.AddPolicyChange(block_parser_.GetDecompressionPolicy(), BlockParser::DecompressionPolicy::kNever);
-        block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kNever);
     }
     else if (pending_batches >= kAsyncWait)
     {
@@ -139,49 +132,9 @@ void AsyncProcessor::ThrottleQueue()
         BatchCount wait_target = enqueued_batch_index_ - kAsyncResume;
         async_stats_.AddHighwaterWait(enqueued_frame_index_, enqueued_batch_index_, pending_batches);
         WaitForBatchCount(wait_target);
-        AdjustDecompressionPolicy(kAsyncResume);
-    }
-    else
-    {
-        // Neither high nor low water, adjust decompression policy to attempt to load balance.
-        AdjustDecompressionPolicy(pending_batches);
     }
 
     async_stats_.IncrementPolicyCount(block_parser_);
-}
-
-void AsyncProcessor::AdjustDecompressionPolicy(BatchCount pending_batches)
-{
-    const auto policy = block_parser_.GetDecompressionPolicy();
-    switch (policy)
-    {
-        case BlockParser::DecompressionPolicy::kNever:
-            if (pending_batches > kAsyncDecompressOptimized)
-            {
-                async_stats_.AddPolicyChange(policy, BlockParser::DecompressionPolicy::kQueueOptimized);
-                block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kQueueOptimized);
-            }
-            break;
-        case BlockParser::DecompressionPolicy::kQueueOptimized:
-            if (pending_batches >= kAsyncDecompressAlways)
-            {
-                async_stats_.AddPolicyChange(policy, BlockParser::DecompressionPolicy::kAlways);
-                block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kAlways);
-            }
-            else if (pending_batches <= kAsyncDecompressNever)
-            {
-                async_stats_.AddPolicyChange(policy, BlockParser::DecompressionPolicy::kNever);
-                block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kNever);
-            }
-            break;
-        case BlockParser::DecompressionPolicy::kAlways:
-            if (pending_batches <= kAsyncDecompressOptimized)
-            {
-                async_stats_.AddPolicyChange(policy, BlockParser::DecompressionPolicy::kQueueOptimized);
-                block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kQueueOptimized);
-            }
-            break;
-    }
 }
 
 // Add the results block for the current frame with a strictly increasing frame index
@@ -224,8 +177,7 @@ void AsyncProcessor::ThreadMain()
     // Enqueue a dummy batch to unblock the BatchIterator.
     AddContinueBatch();
 
-    // Start with async_thread_ doing the minimal, and adjust if it gets too far ahead
-    block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kNever);
+    block_parser_.SetDecompressionPolicy(BlockParser::DecompressionPolicy::kAlways);
     file_processor::AsyncProcessPolicy process_policy{ block_limit_, async_stats_ };
 
     FrameNumber frame_number        = block_processor_->GetProcessFrameNumber();
