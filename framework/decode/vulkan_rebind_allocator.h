@@ -391,10 +391,19 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     friend VKAPI_ATTR void VKAPI_CALL
     OnVmaFreeDeviceMemory(VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*);
 
+    // Owns a zero-initialized buffer. Large buffers are mapped directly and backed by transparent huge pages where
+    // the platform allows it, which keeps the cost of first-touch page faults low.
     struct ZeroedBufferDeleter
     {
-        void operator()(uint8_t* ptr) const { free(ptr); }
+        ZeroedBufferDeleter() noexcept : mapped_size(0) {}
+        explicit ZeroedBufferDeleter(size_t size) noexcept : mapped_size(size) {}
+
+        size_t mapped_size; // non-zero when the buffer was mapped instead of allocated from the heap
+
+        void operator()(uint8_t* ptr) const;
     };
+
+    static std::unique_ptr<uint8_t[], ZeroedBufferDeleter> AllocateZeroedBuffer(size_t size);
 
     struct MemoryAllocInfo;
 
