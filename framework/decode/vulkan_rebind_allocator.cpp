@@ -25,6 +25,10 @@
 // For release compiles, VMA_ASSERT failure is a no-op.
 // The expr_ parameter can be in the form of 'condition && "error string"'.
 // The error string will be printed if condition is false.
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #include "util/logging.h"
 
 #include <ranges>
@@ -2021,6 +2025,38 @@ VkResult VulkanRebindAllocator::SetDebugUtilsObjectTagEXT(VkDevice              
     return functions_.set_debug_utils_object_tag(device, tag_info);
 }
 
+void VulkanRebindAllocator::ZeroedBufferDeleter::operator()(uint8_t* ptr) const
+{
+#if defined(__linux__)
+    if (mapped_size != 0)
+    {
+        munmap(ptr, mapped_size);
+        return;
+    }
+#endif
+    free(ptr);
+}
+
+std::unique_ptr<uint8_t[], VulkanRebindAllocator::ZeroedBufferDeleter>
+VulkanRebindAllocator::AllocateZeroedBuffer(size_t size)
+{
+#if defined(__linux__)
+    constexpr size_t kHugePageSize = 2 * 1024 * 1024;
+    if (size >= kHugePageSize)
+    {
+        void* mapping = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping != MAP_FAILED)
+        {
+            madvise(mapping, size, MADV_HUGEPAGE);
+            return std::unique_ptr<uint8_t[], ZeroedBufferDeleter>(static_cast<uint8_t*>(mapping),
+                                                                   ZeroedBufferDeleter(size));
+        }
+    }
+#endif
+    // calloc returns lazily zeroed pages for large sizes, so only the ranges that get written are touched
+    return std::unique_ptr<uint8_t[], ZeroedBufferDeleter>(static_cast<uint8_t*>(calloc(size, 1)));
+}
+
 VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_data,
                                                        uint64_t       offset,
                                                        uint64_t       size,
@@ -2039,8 +2075,13 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
                 GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, memory_alloc_info->allocation_size);
                 size_t allocation_size = static_cast<size_t>(memory_alloc_info->allocation_size);
 
-                // calloc returns lazily zeroed pages for large sizes, so only the ranges that get written are touched
-                memory_alloc_info->original_content.reset(static_cast<uint8_t*>(calloc(allocation_size, 1)));
+                memory_alloc_info->original_content = AllocateZeroedBuffer(allocation_size);
+                if (memory_alloc_info->original_content == nullptr)
+                {
+                    GFXRECON_LOG_ERROR("Failed to allocate %zu bytes for the shadow copy of mapped memory",
+                                       allocation_size);
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
             }
 
             // Update the reconstructed memory, which is written to memory allocations created at resource bind to
