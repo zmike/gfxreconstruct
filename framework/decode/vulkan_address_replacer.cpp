@@ -735,6 +735,24 @@ void VulkanAddressReplacer::ProcessCmdBindDescriptorSets(VulkanCommandBufferInfo
         return;
     };
 
+    // outside of a render pass, replace the addresses queued by this and earlier binds
+    auto replace_queued_addresses = [&]() {
+        if (!command_buffer_info->in_rendering_scope && !command_buffer_info->addresses_to_replace.empty())
+        {
+            std::vector<VkDeviceAddress> addresses_to_replace(command_buffer_info->addresses_to_replace.begin(),
+                                                              command_buffer_info->addresses_to_replace.end());
+            UpdateBufferAddresses(command_buffer_info, addresses_to_replace, address_tracker);
+            command_buffer_info->addresses_to_replace.clear();
+        }
+    };
+
+    // most pipelines have no buffer references, so skip the setup below
+    if (pipeline_info->buffer_reference_infos.empty())
+    {
+        replace_queued_addresses();
+        return;
+    }
+
     auto injected = device_table_->Open();
 
     std::map<std::pair<VkDescriptorSet, uint32_t>, VkWriteDescriptorSetInlineUniformBlock> sets_requiring_update;
@@ -903,13 +921,7 @@ void VulkanAddressReplacer::ProcessCmdBindDescriptorSets(VulkanCommandBufferInfo
                                        nullptr);
     }
 
-    if (!command_buffer_info->in_rendering_scope)
-    {
-        std::vector<VkDeviceAddress> addresses_to_replace(command_buffer_info->addresses_to_replace.begin(),
-                                                          command_buffer_info->addresses_to_replace.end());
-        UpdateBufferAddresses(command_buffer_info, addresses_to_replace, address_tracker);
-        command_buffer_info->addresses_to_replace.clear();
-    }
+    replace_queued_addresses();
 }
 
 void VulkanAddressReplacer::ProcessCmdTraceRays(
