@@ -33,7 +33,8 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
                             uint32_t                                                  descriptor_write_count,
                             const StructPointerDecoder<Decoded_VkWriteDescriptorSet>* p_descriptor_writes,
                             VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo*    descriptor_bindings,
-                            VkShaderStageFlags                                        stage_flags)
+                            VkShaderStageFlags                                        stage_flags,
+                            bool                                                      buffers_only)
 {
     const auto* writes_meta = p_descriptor_writes->GetMetaStructPointer();
     for (uint32_t w = 0; w < descriptor_write_count; ++w)
@@ -41,6 +42,12 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
         const auto& write_meta    = writes_meta[w];
         const auto* write         = write_meta.decoded_value;
         uint32_t    binding_index = write->dstBinding;
+
+        // without resource dumping, only address replacement reads this state, and only for buffers
+        if (buffers_only && !IsAddressReplacementDescriptorType(write->descriptorType))
+        {
+            continue;
+        }
 
         VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo& descriptor_bindings_info =
             (descriptor_bindings != nullptr) ? (*descriptor_bindings)
@@ -157,6 +164,21 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
 
             ++arr_idx;
         }
+    }
+}
+
+bool IsAddressReplacementDescriptorType(VkDescriptorType type)
+{
+    switch (type)
+    {
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
+            return true;
+        default:
+            return false;
     }
 }
 

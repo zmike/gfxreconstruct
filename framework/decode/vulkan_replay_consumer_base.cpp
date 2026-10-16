@@ -13115,6 +13115,27 @@ void VulkanReplayConsumerBase::UpdateDescriptorSetInfoWithTemplate(
             const uint32_t         count             = entry.descriptorCount;
             const uint32_t         dst_array_element = entry.dstArrayElement;
 
+            // without resource dumping, only address replacement reads this state, and only for buffers
+            if (!options_.dumping_resources && !IsAddressReplacementDescriptorType(type))
+            {
+                if (type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)
+                {
+                    texel_buffer_view_count += count;
+                }
+                else if (type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
+                {
+                    accel_struct_count += count;
+                }
+                else if (type == VK_DESCRIPTOR_TYPE_SAMPLER || type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+                         type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT ||
+                         type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                {
+                    // images and samplers share the image info array
+                    image_info_count += count;
+                }
+                continue;
+            }
+
             desc_set_info->descriptors[binding_index].desc_type = type;
 
             switch (type)
@@ -13996,7 +14017,12 @@ void VulkanReplayConsumerBase::OverrideUpdateDescriptorSets(
     // The information gathered here is only relevant when dumping or for portability-features
     if (UseExtraDescriptorInfo(device_info))
     {
-        HandleDescriptorUpdate(*object_info_table_, descriptor_write_count, p_descriptor_writes);
+        HandleDescriptorUpdate(*object_info_table_,
+                               descriptor_write_count,
+                               p_descriptor_writes,
+                               nullptr,
+                               VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM,
+                               !options_.dumping_resources);
     }
 }
 
