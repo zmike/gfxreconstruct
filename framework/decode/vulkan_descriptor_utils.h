@@ -36,7 +36,11 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
                             uint32_t                                                  descriptor_write_count,
                             const StructPointerDecoder<Decoded_VkWriteDescriptorSet>* p_descriptor_writes,
                             VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo*    descriptor_bindings = nullptr,
-                            VkShaderStageFlags stage_flags = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM);
+                            VkShaderStageFlags stage_flags  = VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM,
+                            bool               buffers_only = false);
+
+// True for the descriptor types whose tracked state address replacement reads.
+bool IsAddressReplacementDescriptorType(VkDescriptorType type);
 
 VkShaderStageFlags PipelineBindPointToShaderStageFlags(VkPipelineBindPoint bind_point);
 
