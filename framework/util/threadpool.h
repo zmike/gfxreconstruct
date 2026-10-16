@@ -24,6 +24,7 @@
 #define GFXRECON_UTIL_THREADPOOL_H
 
 #include "util/defines.h"
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <future>
@@ -97,6 +98,7 @@ class ThreadPool
             constexpr uint32_t           queue_index =
                 std::min(static_cast<uint32_t>(prio), static_cast<uint32_t>(Priority::Default));
             queues_[queue_index].push_back(std::bind(&packaged_task_t::operator(), packed_task));
+            pending_.fetch_add(1, std::memory_order_release);
         }
         condition_.notify_one();
         return future;
@@ -110,7 +112,8 @@ class ThreadPool
      */
     std::size_t poll()
     {
-        if (!running_ && threads_.empty())
+        // replay polls once per block, so skip the lock while nothing is queued
+        if (!running_ && threads_.empty() && pending_.load(std::memory_order_acquire) != 0)
         {
             std::unique_lock<std::mutex> lock(mutex_);
             size_t                       ret = 0;
@@ -122,6 +125,7 @@ class ThreadPool
                 {
                     auto task = std::move(queue.front());
                     queue.pop_front();
+                    pending_.fetch_sub(1, std::memory_order_relaxed);
                     if (task)
                     {
                         task();
@@ -145,6 +149,7 @@ class ThreadPool
             {
                 queue.clear();
             }
+            pending_.store(0, std::memory_order_relaxed);
         }
         condition_.notify_all();
 
@@ -165,6 +170,7 @@ class ThreadPool
         std::unique_lock<std::mutex> lock_rhs(rhs.mutex_, std::adopt_lock);
 
         std::swap(lhs.running_, rhs.running_);
+        lhs.pending_.store(rhs.pending_.exchange(lhs.pending_.load()));
         std::swap(lhs.threads_, rhs.threads_);
 
         for (uint32_t i = 0; i < static_cast<uint32_t>(Priority::NumPriorities); ++i)
@@ -221,6 +227,7 @@ class ThreadPool
                         {
                             task = std::move(queue.front());
                             queue.pop_front();
+                            pending_.fetch_sub(1, std::memory_order_relaxed);
                             break;
                         }
                     }
@@ -245,6 +252,7 @@ class ThreadPool
     std::mutex              mutex_;
     std::condition_variable condition_;
     std::deque<task_t>      queues_[static_cast<uint32_t>(Priority::NumPriorities)];
+    std::atomic<size_t>     pending_{ 0 };
 };
 
 GFXRECON_END_NAMESPACE(util)
