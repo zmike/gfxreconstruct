@@ -47,7 +47,7 @@ class BlockBatch
     // giving performance no worse than capacities >= 2MB.
     constexpr static size_t kCapacity = 256 * 1024;
     // Size threshold for low frequency, large allocations, which are dynamically allocated
-    constexpr static size_t kJumboSize = 1 * 1024;
+    constexpr static size_t kJumboSize = 64 * 1024;
 
     BlockBatch() : allocator_(kCapacity, kJumboSize), head_(nullptr), tail_(nullptr) {}
     ~BlockBatch() = default;
