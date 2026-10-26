@@ -36,7 +36,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <thread>
 #include <unordered_map>
@@ -111,6 +110,12 @@ class VulkanLaneDecoder : public VulkanDecoder
                         {
                             dep = record_.enqueued;
                         }
+                        if (consumer_->IgnoresQueryResults())
+                        {
+                            // The reset of a query pool may be a command the pool must outlive
+                            flush_needed_ |= (call_id == format::ApiCall_vkResetQueryPool) ||
+                                             (call_id == format::ApiCall_vkResetQueryPoolEXT);
+                        }
                         if (call_id == format::ApiCall_vkResetCommandPool)
                         {
                             // The reset waits until a command buffer of the pool is begun
@@ -134,7 +139,7 @@ class VulkanLaneDecoder : public VulkanDecoder
             }
         }
 
-        BeforeInline();
+        BeforeInline(NeedsGpuIdle(call_id));
         VulkanDecoder::DecodeFunctionCall(call_id, call_info, parameter_buffer, buffer_size);
     }
 
@@ -158,6 +163,8 @@ class VulkanLaneDecoder : public VulkanDecoder
                         data,
                         size))
             {
+                // The write may be staged, which the copies must be done with before the buffers go
+                flush_needed_ = true;
                 return;
             }
         }
@@ -180,6 +187,37 @@ class VulkanLaneDecoder : public VulkanDecoder
         kGpu,
         kOrdered
     };
+
+    // Whether a call replayed on the dispatch thread depends on the GPU being done with what was put off. Creating
+    // objects does not.
+    static bool NeedsGpuIdle(format::ApiCallId call_id)
+    {
+        switch (call_id)
+        {
+            case format::ApiCall_vkAllocateDescriptorSets:
+            case format::ApiCall_vkAllocateMemory:
+            case format::ApiCall_vkCreateBuffer:
+            case format::ApiCall_vkCreateBufferView:
+            case format::ApiCall_vkCreateComputePipelines:
+            case format::ApiCall_vkCreateDescriptorSetLayout:
+            case format::ApiCall_vkCreateFramebuffer:
+            case format::ApiCall_vkCreateGraphicsPipelines:
+            case format::ApiCall_vkCreateImage:
+            case format::ApiCall_vkCreateImageView:
+            case format::ApiCall_vkCreatePipelineLayout:
+            case format::ApiCall_vkCreateRenderPass:
+            case format::ApiCall_vkCreateRenderPass2:
+            case format::ApiCall_vkCreateRenderPass2KHR:
+            case format::ApiCall_vkCreateSampler:
+            case format::ApiCall_vkCreateShaderModule:
+            case format::ApiCall_vkGetPhysicalDeviceMemoryProperties:
+            case format::ApiCall_vkGetPhysicalDeviceMemoryProperties2:
+            case format::ApiCall_vkGetPhysicalDeviceMemoryProperties2KHR:
+                return false;
+            default:
+                return true;
+        }
+    }
 
     static CallClass Classify(format::ApiCallId call_id)
     {
@@ -528,11 +566,12 @@ class VulkanLaneDecoder : public VulkanDecoder
 
     enum EntryKind : uint32_t
     {
-        kCall,        // A function call
-        kFill,        // A memory fill: memory id, offset, size, then the data
-        kUnparkReset, // The reset of a command pool that was put off
-        kFlush,       // Everything that was put off
-        kParkedReset  // The reset of a command pool, to put off
+        kCall,              // A function call
+        kFill,              // A memory fill: memory id, offset, size, then the data
+        kUnparkReset,       // The reset of a command pool that was put off
+        kFlush,             // Everything that was put off
+        kCommandBufferWait, // The last submission of a command buffer that is begun again
+        kParkedReset        // The reset of a command pool, to put off
     };
 
     static constexpr uint32_t kWrapId    = 0xffffffffu;
@@ -651,9 +690,12 @@ class VulkanLaneDecoder : public VulkanDecoder
     }
 
     // Before a call is replayed on the dispatch thread, which has the object tables to itself
-    void BeforeInline()
+    void BeforeInline(bool gpu_idle = true)
     {
-        FlushGpu();
+        if (gpu_idle)
+        {
+            FlushGpu();
+        }
         DrainAll();
         tracker_.NoteInlineCall();
     }
@@ -690,7 +732,16 @@ class VulkanLaneDecoder : public VulkanDecoder
         }
         else if (rebegin)
         {
-            FlushGpu();
+            Enqueue(gpu_,
+                    format::ApiCallId::ApiCall_Unknown,
+                    ApiCallInfo{},
+                    nullptr,
+                    0,
+                    kCommandBufferWait,
+                    record_.enqueued,
+                    nullptr,
+                    0,
+                    command_buffer_id);
             dep = gpu_.enqueued;
         }
         return dep;
@@ -897,11 +948,13 @@ class VulkanLaneDecoder : public VulkanDecoder
                     case kFill:
                     {
                         const uint64_t* header = reinterpret_cast<const uint64_t*>(parameters);
-                        tracker_.BeforeFill(header[0], header[1], header[2]);
+                        const bool      stage  = tracker_.BeforeFill(header[0], header[1], header[2]);
+                        VulkanRebindAllocator::SetStageFills(stage);
                         VulkanRebindAllocator::SetShadowCopyElsewhere(header[3] != 0);
                         lane.decoder.DispatchFillMemoryCommand(
                             0, header[0], header[1], header[2], parameters + entry->parameter_size);
                         VulkanRebindAllocator::SetShadowCopyElsewhere(false);
+                        VulkanRebindAllocator::SetStageFills(false);
                         break;
                     }
                     case kParkedReset:
@@ -915,6 +968,14 @@ class VulkanLaneDecoder : public VulkanDecoder
                     case kUnparkReset:
                         RunParkedReset(lane, entry->pool);
                         break;
+
+                    case kCommandBufferWait:
+                    {
+                        const VulkanCommandBufferInfo* info =
+                            consumer_->GetLaneObjectTable().GetVkCommandBufferInfo(entry->pool);
+                        tracker_.BeforeCommandBufferBegin((info != nullptr) ? info->handle : VK_NULL_HANDLE);
+                        break;
+                    }
                     case kFlush:
                         tracker_.Flush();
                         while (!parked_resets_.empty())
@@ -930,6 +991,11 @@ class VulkanLaneDecoder : public VulkanDecoder
                         else if (VulkanLaneGpuObserver::Follows(call_id))
                         {
                             gpu_peek_.DecodeFunctionCall(call_id, call_info, parameters, entry->parameter_size);
+                            if (tracker_.TakeQueryResetStaged())
+                            {
+                                // The reset is a command that runs after the GPU is done with the pool
+                                break;
+                            }
                         }
                         lane.decoder.DecodeFunctionCall(call_id, call_info, parameters, entry->parameter_size);
                         break;

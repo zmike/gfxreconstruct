@@ -24,6 +24,7 @@
 #define GFXRECON_DECODE_VULKAN_LANE_TRACKER_H
 
 #include "decode/value_decoder.h"
+#include "decode/vulkan_rebind_allocator.h"
 #include "decode/vulkan_replay_consumer_base.h"
 #include "format/api_call_id.h"
 #include "generated/generated_vulkan_consumer.h"
@@ -38,6 +39,8 @@
 #include <mutex>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
@@ -79,6 +82,25 @@ class VulkanLaneTracker
 
     uint32_t Epoch() const { return epoch_.load(std::memory_order_relaxed); }
 
+    // Record lane: a query pool that takes the compacted sizes of acceleration structures, which replay reads back
+    void NoteCompactPool(format::HandleId pool_id)
+    {
+        std::lock_guard<std::mutex> lock(cb_mutex_);
+        compact_pools_.insert(pool_id);
+        any_compact_pool_.store(true, std::memory_order_release);
+    }
+
+    bool IsCompactPool(format::HandleId pool_id)
+    {
+        // The set is empty unless the capture reads back acceleration structure sizes
+        if (!any_compact_pool_.load(std::memory_order_acquire))
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(cb_mutex_);
+        return compact_pools_.contains(pool_id);
+    }
+
     // Record lane: a command buffer that is complete
     void PublishCommandBuffer(VkCommandBuffer command_buffer, std::shared_ptr<const LaneCbReads> reads)
     {
@@ -105,8 +127,10 @@ class VulkanLaneTracker
 
     // ---- gpu lane ----
 
-    void OnSubmit(VkQueue queue, std::span<const VkSubmitInfo> submits, VkFence fence)
+    void OnSubmit(
+        VkQueue queue, VkDevice device, uint32_t queue_family, std::span<const VkSubmitInfo> submits, VkFence fence)
     {
+        NoteQueue(device, queue_family);
         for (const VkSubmitInfo& submit : submits)
         {
             const uint64_t*                         values = nullptr;
@@ -137,8 +161,10 @@ class VulkanLaneTracker
         NoteFence(fence);
     }
 
-    void OnSubmit(VkQueue queue, std::span<const VkSubmitInfo2> submits, VkFence fence)
+    void OnSubmit(
+        VkQueue queue, VkDevice device, uint32_t queue_family, std::span<const VkSubmitInfo2> submits, VkFence fence)
     {
+        NoteQueue(device, queue_family);
         for (const VkSubmitInfo2& submit : submits)
         {
             const uint64_t n = BeginSubmission(queue);
@@ -179,6 +205,7 @@ class VulkanLaneTracker
             return true;
         }
 
+        timeline_seen_    = true;
         PendingWait& wait = pending_.emplace_back();
         wait.device       = device;
         wait.cover        = cover;
@@ -191,8 +218,23 @@ class VulkanLaneTracker
         return true;
     }
 
-    // The host is about to write captured memory
-    void BeforeFill(uint64_t memory_id, uint64_t offset, uint64_t size)
+    // A host reset of a query pool becomes a command the next submission follows. False if it has to run on the host.
+    bool StageQueryReset(VulkanRebindAllocator* allocator, VkQueryPool pool, uint32_t first, uint32_t count)
+    {
+        if (!CanStage(allocator) || !allocator->StageQueryReset(pool, first, count))
+        {
+            return false;
+        }
+        NoteStagedAllocator(allocator);
+        query_reset_staged_ = true;
+        return true;
+    }
+
+    bool TakeQueryResetStaged() { return std::exchange(query_reset_staged_, false); }
+
+    // The host is about to write captured memory. True if the write is to be staged, which puts the copy to the buffers
+    // off to the next submission.
+    bool BeforeFill(uint64_t memory_id, uint64_t offset, uint64_t size)
     {
         auto it = memories_.find(memory_id);
         if (it == memories_.end())
@@ -203,14 +245,10 @@ class VulkanLaneTracker
             {
                 Complete(last_submission_);
             }
-            return;
-        }
-        if (pending_.empty())
-        {
-            return;
+            return false;
         }
 
-        MemoryState& memory = it->second;
+        MemoryState&   memory  = it->second;
         const uint32_t version = Version();
         if (memory.version != version)
         {
@@ -219,21 +257,71 @@ class VulkanLaneTracker
             memory.mapped  = consumer_->GetLaneMappedWriteTarget(memory_id, &memory.mapped_offset, &memory.only_buffers);
         }
 
-        // Writes that cannot be placed, and memory with images in it, may reach anything
-        uint64_t last = all_stamp_;
-        if (!memory.mapped || !memory.only_buffers)
+        const bool     placed = memory.mapped && memory.only_buffers;
+        const uint64_t begin  = memory.mapped_offset + offset;
+
+        // Staged writes that the copies have not been submitted for are overwritten by them
+        bool staged_overlap = false;
+        for (const auto& range : memory.staged)
         {
-            last = std::max(last, last_submission_);
+            staged_overlap |= !placed || ((begin < range.second) && (range.first < begin + size));
         }
-        else
+
+        // Writes that cannot be placed, and memory with images in it, may reach anything
+        uint64_t last = 0;
+        if (!pending_.empty())
         {
-            const uint64_t begin = memory.mapped_offset + offset;
-            last                 = std::max(last, MaxStamp(memory.stamps, begin, begin + size));
+            last = all_stamp_;
+            if (!placed)
+            {
+                last = std::max(last, last_submission_);
+            }
+            else
+            {
+                last = std::max(last, MaxStamp(memory.stamps, begin, begin + size));
+            }
+        }
+        if (!staged_overlap && (last <= done_))
+        {
+            return false;
+        }
+
+        if (placed)
+        {
+            VulkanResourceAllocator::MemoryData allocator_data{};
+            VulkanRebindAllocator*              allocator = consumer_->GetLaneFillAllocator(memory_id, &allocator_data);
+            uint64_t                            bytes     = 0;
+            if (CanStage(allocator) && allocator->CanStageFill(allocator_data, begin, size, &bytes))
+            {
+                if (bytes != 0)
+                {
+                    if (memory.staged.empty())
+                    {
+                        staged_memories_.push_back(memory_id);
+                    }
+                    if (staged_overlap)
+                    {
+                        // Buffers that share the bytes are not ordered by their own copies
+                        allocator->StageOrder();
+                    }
+                    memory.staged.emplace_back(begin, begin + size);
+                    NoteStagedAllocator(allocator);
+                }
+                return bytes != 0;
+            }
+        }
+
+        // The copies are submitted to wait for
+        FlushStaged();
+        if (staged_overlap)
+        {
+            last = last_submission_;
         }
         if (last > done_)
         {
             Complete(last);
         }
+        return false;
     }
 
     // A memory was mapped or unmapped
@@ -269,6 +357,18 @@ class VulkanLaneTracker
         }
     }
 
+    // A command buffer is about to be begun again, which resets it
+    void BeforeCommandBufferBegin(VkCommandBuffer command_buffer)
+    {
+        auto it = cb_stamps_.find(command_buffer);
+        // A secondary command buffer that an unfollowed primary executed has no stamp of its own
+        const uint64_t stamp = std::max((it != cb_stamps_.end()) ? it->second : last_submission_, all_stamp_);
+        if (stamp > done_)
+        {
+            Complete(stamp);
+        }
+    }
+
     // The host is about to reset fences, or reset or read a query pool
     void BeforeFenceReset(VkFence fence)
     {
@@ -292,6 +392,7 @@ class VulkanLaneTracker
     // Anything else that may depend on the GPU being done
     void Flush()
     {
+        FlushStaged();
         if (!pending_.empty())
         {
             Complete(UINT64_MAX);
@@ -394,6 +495,7 @@ class VulkanLaneTracker
     struct MemoryState
     {
         std::vector<uint32_t> stamps; // The last submission per granule that read it
+        std::vector<std::pair<uint64_t, uint64_t>> staged; // Staged writes not submitted the copies for
         uint32_t              version{ UINT32_MAX };
         uint64_t              mapped_offset{ 0 };
         bool                  mapped{ false };
@@ -440,6 +542,73 @@ class VulkanLaneTracker
             last_buffer_base_ = &it->second;
         }
         return *last_buffer_base_;
+    }
+
+    void NoteQueue(VkDevice device, uint32_t queue_family)
+    {
+        // The copies of staged writes go before the submission, to the queue they were staged for
+        FlushStaged();
+        if (queue_ == VK_NULL_HANDLE)
+        {
+            queue_device_ = device;
+            queue_family_ = queue_family;
+        }
+    }
+
+    // Copies and resets can go to the queue the application submits to
+    bool CanStage(const VulkanRebindAllocator* allocator) const
+    {
+        return !disabled_ && timeline_seen_ && (allocator != nullptr) && (allocator->GetDevice() == queue_device_);
+    }
+
+    void NoteStagedAllocator(VulkanRebindAllocator* allocator)
+    {
+        if (std::find(staged_allocators_.begin(), staged_allocators_.end(), allocator) == staged_allocators_.end())
+        {
+            staged_allocators_.push_back(allocator);
+        }
+    }
+
+    // Submits the copies of the staged writes. They are submissions that the host waits for as it does for the
+    // application's, and that write the ranges.
+    void FlushStaged()
+    {
+        if (staged_allocators_.empty() || (queue_ == VK_NULL_HANDLE))
+        {
+            return;
+        }
+        for (VulkanRebindAllocator* allocator : staged_allocators_)
+        {
+            VkSemaphore semaphore = VK_NULL_HANDLE;
+            uint64_t    value     = 0;
+            if (!allocator->SubmitStagedFills(queue_, queue_family_, &semaphore, &value))
+            {
+                continue;
+            }
+            const uint64_t n    = BeginSubmission(queue_);
+            PendingWait&   wait = pending_.emplace_back();
+            wait.device         = allocator->GetDevice();
+            wait.cover          = n;
+            wait.semaphores.push_back(semaphore);
+            wait.values.push_back(value);
+            for (uint64_t memory_id : staged_memories_)
+            {
+                for (const auto& range : memories_[memory_id].staged)
+                {
+                    StampRange({ memory_id, range.first, range.second }, n);
+                }
+            }
+        }
+        for (uint64_t memory_id : staged_memories_)
+        {
+            memories_[memory_id].staged.clear();
+        }
+        staged_memories_.clear();
+        staged_allocators_.clear();
+        if (pending_.size() > kMaxPending)
+        {
+            Complete(pending_.front().cover);
+        }
     }
 
     uint64_t BeginSubmission(VkQueue queue)
@@ -566,6 +735,7 @@ class VulkanLaneTracker
 
     void StampCommandBuffer(VkCommandBuffer command_buffer, uint64_t submission, uint32_t depth)
     {
+        cb_stamps_[command_buffer] = submission;
         std::shared_ptr<const LaneCbReads> reads;
         {
             std::lock_guard<std::mutex> lock(cb_mutex_);
@@ -656,8 +826,17 @@ class VulkanLaneTracker
 
     std::mutex                                                          cb_mutex_;
     std::unordered_map<VkCommandBuffer, std::shared_ptr<const LaneCbReads>> command_buffers_;
+    std::unordered_set<format::HandleId>                                    compact_pools_;
+    std::atomic<bool>                                                       any_compact_pool_{ false };
 
     VkQueue  queue_{ VK_NULL_HANDLE };
+    std::unordered_map<VkCommandBuffer, uint64_t> cb_stamps_; // The last submission of each command buffer
+    VkDevice                                      queue_device_{ VK_NULL_HANDLE };
+    uint32_t                                      queue_family_{ 0 };
+    bool                                          timeline_seen_{ false };
+    bool                                          query_reset_staged_{ false };
+    std::vector<uint64_t>                         staged_memories_;
+    std::vector<VulkanRebindAllocator*>           staged_allocators_;
     bool     disabled_{ false };
     uint64_t submissions_{ 0 };
     uint64_t last_submission_{ 0 };
@@ -717,6 +896,7 @@ class VulkanLaneRecordObserver : public VulkanConsumer
             case format::ApiCall_vkCmdWriteTimestamp:
             case format::ApiCall_vkCmdWriteTimestamp2:
             case format::ApiCall_vkCmdWriteTimestamp2KHR:
+            case format::ApiCall_vkCmdWriteAccelerationStructuresPropertiesKHR:
                 return;
             // The calls that read no buffer
         case format::ApiCall_vkCmdBeginDebugUtilsLabelEXT:
@@ -1074,6 +1254,12 @@ class VulkanLaneRecordObserver : public VulkanConsumer
         AddQueryPool(args.commandBuffer, args.queryPool);
     }
 
+    void Process_vkCmdWriteAccelerationStructuresPropertiesKHR(
+        const ApiCallInfo& call_info, args::CmdWriteAccelerationStructuresPropertiesKHR& args) override
+    {
+        tracker_->NoteCompactPool(args.queryPool);
+    }
+
     void Process_vkCmdExecuteCommands(const ApiCallInfo& call_info, args::CmdExecuteCommands& args) override
     {
         CbBuild&                build = GetBuild(args.commandBuffer);
@@ -1233,16 +1419,21 @@ class VulkanLaneGpuObserver : public VulkanConsumer
 
     void Process_vkResetQueryPool(const ApiCallInfo& call_info, args::ResetQueryPool& args) override
     {
-        tracker_->BeforeQueryPoolUse(args.queryPool);
+        ResetQueryPool(args.device, args.queryPool, args.firstQuery, args.queryCount);
     }
 
     void Process_vkResetQueryPoolEXT(const ApiCallInfo& call_info, args::ResetQueryPoolEXT& args) override
     {
-        tracker_->BeforeQueryPoolUse(args.queryPool);
+        ResetQueryPool(args.device, args.queryPool, args.firstQuery, args.queryCount);
     }
 
     void Process_vkGetQueryPoolResults(const ApiCallInfo& call_info, args::GetQueryPoolResults& args) override
     {
+        // A skipped call does not wait for the GPU
+        if (consumer_->IgnoresQueryResults() && !tracker_->IsCompactPool(args.queryPool))
+        {
+            return;
+        }
         tracker_->BeforeQueryPoolUse(args.queryPool);
     }
 
@@ -1257,6 +1448,24 @@ class VulkanLaneGpuObserver : public VulkanConsumer
     }
 
   private:
+    // With the results ignored, the reset goes to a command that the GPU runs once it is done with the pool
+    void ResetQueryPool(format::HandleId device_id, format::HandleId pool_id, uint32_t first, uint32_t count)
+    {
+        if (consumer_->IgnoresQueryResults() && !tracker_->IsCompactPool(pool_id))
+        {
+            const CommonObjectInfoTable& table       = consumer_->GetLaneObjectTable();
+            const VulkanDeviceInfo*      device_info = table.GetVkDeviceInfo(device_id);
+            const VulkanQueryPoolInfo*   pool_info   = table.GetVkQueryPoolInfo(pool_id);
+            VulkanRebindAllocator*       allocator =
+                (device_info != nullptr) ? dynamic_cast<VulkanRebindAllocator*>(device_info->allocator.get()) : nullptr;
+            if ((pool_info != nullptr) && tracker_->StageQueryReset(allocator, pool_info->handle, first, count))
+            {
+                return;
+            }
+        }
+        tracker_->BeforeQueryPoolUse(pool_id);
+    }
+
     VulkanReplayConsumerBase* consumer_;
     VulkanLaneTracker*        tracker_;
 };

@@ -5156,6 +5156,11 @@ void VulkanReplayConsumerBase::ApplyRecordedQueryOps(const VulkanCommandBufferIn
     }
 }
 
+bool VulkanReplayConsumerBase::SkipsQueryResults(const VulkanDeviceInfo* device_info, VkQueryPool query_pool)
+{
+    return options_.ignore_query_results && !GetDeviceAddressReplacer(device_info).HasCompactQueries(query_pool);
+}
+
 VkResult VulkanReplayConsumerBase::OverrideGetQueryPoolResults(PFN_vkGetQueryPoolResults  func,
                                                                VkResult                   original_result,
                                                                const VulkanDeviceInfo*    device_info,
@@ -5172,6 +5177,11 @@ VkResult VulkanReplayConsumerBase::OverrideGetQueryPoolResults(PFN_vkGetQueryPoo
 
     VkDevice    device     = device_info->handle;
     VkQueryPool query_pool = query_pool_info->handle;
+
+    if (SkipsQueryResults(device_info, query_pool))
+    {
+        return original_result;
+    }
 
     // A captured VK_SUCCESS must be reproduced at replay to preserve synchronization, but:
     // wait only when the replayed stream makes all requested queries available -> avoid blocking forever.
@@ -5322,7 +5332,8 @@ VkResult VulkanReplayConsumerBase::OverrideQueueSubmit(PFN_vkQueueSubmit        
 
     if (lane_tracker_ != nullptr)
     {
-        lane_tracker_->OnSubmit(queue_info->handle, current_submits_span, fence);
+        lane_tracker_->OnSubmit(
+            queue_info->handle, device_info->handle, queue_info->family_index, current_submits_span, fence);
     }
 
     if (options_.idle_before_submit)
@@ -5604,7 +5615,8 @@ VkResult VulkanReplayConsumerBase::OverrideQueueSubmit2(PFN_vkQueueSubmit2      
 
     if (lane_tracker_ != nullptr)
     {
-        lane_tracker_->OnSubmit(queue_info->handle, current_submits_span, fence);
+        lane_tracker_->OnSubmit(
+            queue_info->handle, device_info->handle, queue_info->family_index, current_submits_span, fence);
     }
 
     if (options_.idle_before_submit)
@@ -14230,6 +14242,19 @@ bool VulkanReplayConsumerBase::GetLaneMappedWriteTarget(format::HandleId memory_
     }
     *mapped_offset = offset;
     return true;
+}
+
+VulkanRebindAllocator*
+VulkanReplayConsumerBase::GetLaneFillAllocator(format::HandleId                     memory_id,
+                                               VulkanResourceAllocator::MemoryData* allocator_data) const
+{
+    const VulkanDeviceMemoryInfo* memory_info = object_info_table_->GetVkDeviceMemoryInfo(memory_id);
+    VulkanRebindAllocator*        allocator   = GetLaneRebindAllocator(memory_info);
+    if (allocator != nullptr)
+    {
+        *allocator_data = memory_info->allocator_data;
+    }
+    return allocator;
 }
 
 bool VulkanReplayConsumerBase::CopyLaneFillShadow(

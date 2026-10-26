@@ -92,6 +92,7 @@ const char kEnableUseCapturedSwapchainIndices[] =
 const char kVirtualSwapchainSkipBlitShortOption[] = "--vssb";
 const char kVirtualSwapchainSkipBlitLongOption[]  = "--virtual-swapchain-skip-blit";
 const char kRecordLaneOption[]                    = "--record-lane";
+const char kIgnoreQueryResultsOption[]            = "--ignore-query-results";
 const char kColorspaceFallback[]                  = "--use-colorspace-fallback";
 const char kOffscreenSwapchainFrameBoundary[]     = "--offscreen-swapchain-frame-boundary";
 // The short forms of the two skip-get-fence entries.
@@ -359,6 +360,8 @@ GetVulkanReplayOptions(const gfxrecon::util::ArgumentParser&           arg_parse
 
     replay_options.record_lane = arg_parser.IsOptionSet(kRecordLaneOption);
 
+    replay_options.ignore_query_results = arg_parser.IsOptionSet(kIgnoreQueryResultsOption);
+
     const std::string debug_severity_string = arg_parser.GetArgumentValue(kDebugMessageSeverityArgument);
     if (!debug_severity_string.empty())
     {
@@ -611,6 +614,12 @@ std::vector<util::FeatureOptionDesc> ReplayVulkanFeature::GetOptionDescs() const
                  "descriptor updates." },
                false,
                kRecordLaneOption },
+             { "",
+               { "Do not call vkGetQueryPoolResults, so replay does not wait for the GPU to finish queries. The",
+                 "results are not read back, except for acceleration structure compaction sizes. For performance",
+                 "measurements, when nothing in the replay depends on the wait." },
+               false,
+               kIgnoreQueryResultsOption },
              { "",
                { "The same as \"--swapchain captured\".",
                  "Replay ignores this entry when the \"--swapchain\" entry is present." },

@@ -335,6 +335,12 @@ class VulkanAddressReplacer
                                     VkQueryResultFlags flags);
 
     /**
+     * @brief   Returns true if the pool holds running acceleration-structure compaction queries, whose results
+     *          replay needs.
+     */
+    bool HasCompactQueries(VkQueryPool query_pool) const { return as_compact_queries_.contains(query_pool); }
+
+    /**
      * @brief   Process information contained in a metadata-block in order to build acceleration-structures.
      *
      * Will use an internal command-buffer, submit work to a VkQueue and perform host-synchronization.

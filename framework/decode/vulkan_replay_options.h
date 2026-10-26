@@ -171,6 +171,7 @@ struct VulkanReplayOptions : public ReplayOptions
     util::PresentModeOption present_mode_option{ util::PresentModeOption::kCapture };
     bool                    virtual_swapchain_skip_blit{ false };
     bool                    record_lane{ false };
+    bool                    ignore_query_results{ false };
     bool                    annotate_injected_commands{ false };
 
     // optionally override swapchain-images by providing an image debug-utils name
