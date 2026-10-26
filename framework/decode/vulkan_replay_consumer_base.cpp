@@ -14349,8 +14349,10 @@ bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCa
     GetDeviceTable(device_info->handle)
         ->UpdateDescriptorSets(device_info->handle, write_count, scratch.writes.data(), 0, nullptr);
 
-    // The information gathered here is only relevant when dumping or for portability-features
-    if (UseExtraDescriptorInfo(device_info))
+    // The buffer descriptors are only used when dumping or by the address replacer, which has nothing to replace on
+    // devices without bufferDeviceAddress
+    if (options_.dumping_resources ||
+        (UseAddressReplacement(device_info) && device_info->property_feature_info.feature_bufferDeviceAddress))
     {
         for (size_t w = 0; w < scratch.writes.size(); ++w)
         {
