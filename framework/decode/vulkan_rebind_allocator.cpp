@@ -2152,12 +2152,11 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
             }
 
             // Update the reconstructed memory, which is written to memory allocations created at resource bind to
-            // ensure they contain the correct data.
-            GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, size);
-            size_t   copy_size = static_cast<size_t>(size);
-            uint8_t* copy_dst  = memory_alloc_info->original_content.get() + memory_alloc_info->mapped_offset + offset;
-
-            util::platform::MemoryCopy(copy_dst, copy_size, data, copy_size);
+            // ensure they contain the correct data. WriteShadowCopy does it when the caller leaves it to that.
+            if (!shadow_elsewhere)
+            {
+                CopyToShadow(memory_alloc_info, memory_alloc_info->mapped_offset + offset, size, data);
+            }
 
             VkDeviceSize write_start = memory_alloc_info->mapped_offset + offset;
             VkDeviceSize write_end   = write_start + size;
@@ -2169,13 +2168,6 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
                 {
                     UpdateBoundResource(entry.second, entry_bound, write_start, write_end, data);
                 }
-            }
-
-            // Update the reconstructed memory, which is written to memory allocations created at resource bind to
-            // ensure they contain the correct data.
-            if (!shadow_elsewhere)
-            {
-                CopyToShadow(memory_alloc_info, memory_alloc_info->mapped_offset + offset, size, data);
             }
 
             result = VK_SUCCESS;
@@ -2324,9 +2316,13 @@ bool VulkanRebindAllocator::ReserveFillStage(VkDeviceSize size, VkDeviceSize* of
 
 bool VulkanRebindAllocator::StageableBuffer(const ResourceAllocInfo* resource_alloc_info,
                                             const VmaMemoryInfo*     bound_memory_info,
+                                            VkDeviceSize             dst_offset,
                                             VkBuffer*                buffer) const
 {
-    if ((resource_alloc_info->object_type != VK_OBJECT_TYPE_BUFFER) ||
+    // The copy goes to an offset in the buffer, which is the offset in the allocation only if the buffer owns the
+    // allocation
+    if ((resource_alloc_info->object_type != VK_OBJECT_TYPE_BUFFER) || (bound_memory_info->reference_count != 1) ||
+        (dst_offset >= resource_alloc_info->create_size) ||
         ((resource_alloc_info->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) == 0) || !bound_memory_info->is_host_visible ||
         (bound_memory_info->mapped_pointer == nullptr) || (bound_memory_info->memory_info == nullptr))
     {
@@ -2368,8 +2364,7 @@ bool VulkanRebindAllocator::CanStageFill(MemoryData allocator_data,
             VkDeviceSize data_size  = 0;
             if (TranslateMemoryRange(bound, position, position + size, &src_offset, &dst_offset, &data_size))
             {
-                VkBuffer buffer;
-                if (!StageableBuffer(entry.second, bound, &buffer))
+                if (!StageableBuffer(entry.second, bound, dst_offset, nullptr))
                 {
                     return false;
                 }
@@ -2403,9 +2398,16 @@ bool VulkanRebindAllocator::StageBoundBuffer(ResourceAllocInfo* resource_alloc_i
                                              VkDeviceSize       data_size,
                                              const uint8_t*     data)
 {
-    VkBuffer           buffer;
+    VkBuffer buffer;
+    if (!StageableBuffer(resource_alloc_info, bound_memory_info, dst_offset, &buffer))
+    {
+        return false;
+    }
+    // The part of the write that is past the end of the buffer is padding that the GPU does not read
+    data_size = std::min(data_size, resource_alloc_info->create_size - dst_offset);
+
     const VkDeviceSize reserve = util::aligned_value(data_size, kFillAlignment);
-    if ((fill_reserved_left_ < reserve) || !StageableBuffer(resource_alloc_info, bound_memory_info, &buffer))
+    if (fill_reserved_left_ < reserve)
     {
         return false;
     }

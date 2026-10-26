@@ -80,6 +80,18 @@ class VulkanLaneTracker
     // Dispatch thread: replay of a call that changes the object tables
     void NoteInlineCall() { epoch_.fetch_add(1, std::memory_order_relaxed); }
 
+    // A semaphore is destroyed, and a new one may have its handle. Called with the gpu lane idle.
+    void ForgetSemaphore(VkSemaphore semaphore) { semaphores_.erase(semaphore); }
+    void ForgetSemaphores() { semaphores_.clear(); }
+
+    // The host signals a semaphore to a value, which the queue submissions do not account for. Waits for values up to
+    // it run when they come. Called with the gpu lane idle.
+    void NoteHostSignal(VkSemaphore semaphore, uint64_t value)
+    {
+        SemaphoreSignals& entry = semaphores_[semaphore];
+        entry.host_value        = std::max(entry.host_value, value);
+    }
+
     uint32_t Epoch() const { return epoch_.load(std::memory_order_relaxed); }
 
     // Record lane: a query pool that takes the compacted sizes of acceleration structures, which replay reads back
@@ -264,7 +276,11 @@ class VulkanLaneTracker
         bool staged_overlap = false;
         for (const auto& range : memory.staged)
         {
-            staged_overlap |= !placed || ((begin < range.second) && (range.first < begin + size));
+            if (!placed || ((begin < range.second) && (range.first < begin + size)))
+            {
+                staged_overlap = true;
+                break;
+            }
         }
 
         // Writes that cannot be placed, and memory with images in it, may reach anything
@@ -513,6 +529,7 @@ class VulkanLaneTracker
         std::deque<Signal> signals;
         uint64_t           trimmed_value{ 0 }; // Waits up to this value are done
         bool               trimmed{ false };
+        uint64_t           host_value{ 0 }; // Waits up to this value may be met by the host
     };
 
     uint32_t Version() const { return epoch_.load(std::memory_order_relaxed) + mapping_version_; }
@@ -662,6 +679,10 @@ class VulkanLaneTracker
             return false;
         }
         const SemaphoreSignals& entry = it->second;
+        if (value <= entry.host_value)
+        {
+            return false;
+        }
         if (entry.trimmed && (value <= entry.trimmed_value))
         {
             *cover = 0;
@@ -808,7 +829,16 @@ class VulkanLaneTracker
         auto      it  = std::lower_bound(set.slots.begin(), set.slots.end(), slot, [](const Slot& a, const Slot& b) {
             return (a.binding != b.binding) ? (a.binding < b.binding) : (a.element < b.element);
         });
-        if ((it != set.slots.end()) && (it->binding == binding) && (it->element == element))
+        const bool found = (it != set.slots.end()) && (it->binding == binding) && (it->element == element);
+        if (!slot.has_range && !slot.unknown)
+        {
+            // A descriptor that reads no buffer has nothing to stamp, so it only clears what was there
+            if (found)
+            {
+                set.slots.erase(it);
+            }
+        }
+        else if (found)
         {
             *it = slot;
         }
@@ -882,6 +912,12 @@ class VulkanLaneRecordObserver : public VulkanConsumer
             case format::ApiCall_vkCmdBindIndexBuffer2KHR:
             case format::ApiCall_vkCmdBindVertexBuffers2EXT:
             case format::ApiCall_vkCmdBindDescriptorSets:
+            case format::ApiCall_vkCmdBindDescriptorSets2:
+            case format::ApiCall_vkCmdBindDescriptorSets2KHR:
+            case format::ApiCall_vkCmdResetQueryPool:
+            case format::ApiCall_vkCmdBeginQueryIndexedEXT:
+            case format::ApiCall_vkCmdEndQueryIndexedEXT:
+            case format::ApiCall_vkCmdCopyQueryPoolResults:
             case format::ApiCall_vkCmdCopyBuffer:
             case format::ApiCall_vkCmdCopyBufferToImage:
             case format::ApiCall_vkCmdFillBuffer:
@@ -1057,7 +1093,6 @@ class VulkanLaneRecordObserver : public VulkanConsumer
         case format::ApiCall_vkCmdWaitEvents:
         case format::ApiCall_vkCmdWaitEvents2:
         case format::ApiCall_vkCmdWaitEvents2KHR:
-        case format::ApiCall_vkCmdResetQueryPool:
         case format::ApiCall_vkCmdPushConstants2:
         case format::ApiCall_vkCmdPushConstants2KHR:
         case format::ApiCall_vkCmdEndRendering2KHR:
@@ -1162,17 +1197,59 @@ class VulkanLaneRecordObserver : public VulkanConsumer
                           args.pSizes.GetPointer());
     }
 
-    void Process_vkCmdBindDescriptorSets(const ApiCallInfo& call_info, args::CmdBindDescriptorSets& args) override
+    void BindDescriptorSets(format::HandleId command_buffer_id, const format::HandleId* sets, uint32_t count)
     {
-        CbBuild&                build = GetBuild(args.commandBuffer);
-        const format::HandleId* sets  = args.pDescriptorSets.GetPointer();
-        for (uint32_t i = 0; (sets != nullptr) && (i < args.descriptorSetCount); ++i)
+        CbBuild& build = GetBuild(command_buffer_id);
+        for (uint32_t i = 0; (sets != nullptr) && (i < count); ++i)
         {
             if (build.reads.sets.empty() || (build.reads.sets.back() != sets[i]))
             {
                 build.reads.sets.push_back(sets[i]);
             }
         }
+    }
+
+    void BindDescriptorSets2(format::HandleId                                        command_buffer_id,
+                             StructPointerDecoder<Decoded_VkBindDescriptorSetsInfo>& info)
+    {
+        const Decoded_VkBindDescriptorSetsInfo* meta = info.GetMetaStructPointer();
+        const VkBindDescriptorSetsInfo*         bind = info.GetPointer();
+        if ((meta != nullptr) && (bind != nullptr))
+        {
+            BindDescriptorSets(command_buffer_id, meta->pDescriptorSets.GetPointer(), bind->descriptorSetCount);
+        }
+    }
+
+    void Process_vkCmdBindDescriptorSets(const ApiCallInfo& call_info, args::CmdBindDescriptorSets& args) override
+    {
+        BindDescriptorSets(args.commandBuffer, args.pDescriptorSets.GetPointer(), args.descriptorSetCount);
+    }
+
+    void Process_vkCmdBindDescriptorSets2(const ApiCallInfo& call_info, args::CmdBindDescriptorSets2& args) override
+    {
+        BindDescriptorSets2(args.commandBuffer, args.pBindDescriptorSetsInfo);
+    }
+
+    void Process_vkCmdBindDescriptorSets2KHR(const ApiCallInfo&               call_info,
+                                             args::CmdBindDescriptorSets2KHR& args) override
+    {
+        BindDescriptorSets2(args.commandBuffer, args.pBindDescriptorSetsInfo);
+    }
+
+    void Process_vkCmdBeginQueryIndexedEXT(const ApiCallInfo& call_info, args::CmdBeginQueryIndexedEXT& args) override
+    {
+        AddQueryPool(args.commandBuffer, args.queryPool);
+    }
+
+    void Process_vkCmdEndQueryIndexedEXT(const ApiCallInfo& call_info, args::CmdEndQueryIndexedEXT& args) override
+    {
+        AddQueryPool(args.commandBuffer, args.queryPool);
+    }
+
+    void Process_vkCmdCopyQueryPoolResults(const ApiCallInfo& call_info, args::CmdCopyQueryPoolResults& args) override
+    {
+        AddQueryPool(args.commandBuffer, args.queryPool);
+        AddRead(args.commandBuffer, args.dstBuffer, args.dstOffset, VK_WHOLE_SIZE);
     }
 
     void Process_vkCmdCopyBuffer(const ApiCallInfo& call_info, args::CmdCopyBuffer& args) override
@@ -1258,6 +1335,12 @@ class VulkanLaneRecordObserver : public VulkanConsumer
         const ApiCallInfo& call_info, args::CmdWriteAccelerationStructuresPropertiesKHR& args) override
     {
         tracker_->NoteCompactPool(args.queryPool);
+        AddQueryPool(args.commandBuffer, args.queryPool);
+    }
+
+    void Process_vkCmdResetQueryPool(const ApiCallInfo& call_info, args::CmdResetQueryPool& args) override
+    {
+        AddQueryPool(args.commandBuffer, args.queryPool);
     }
 
     void Process_vkCmdExecuteCommands(const ApiCallInfo& call_info, args::CmdExecuteCommands& args) override
@@ -1388,6 +1471,14 @@ class VulkanLaneGpuObserver : public VulkanConsumer
         consumer_(consumer), tracker_(tracker)
     {}
 
+    // The calls that the dispatch thread replays with the lanes idle
+    static bool FollowsInline(format::ApiCallId call_id)
+    {
+        return (call_id == format::ApiCall_vkSignalSemaphore) || (call_id == format::ApiCall_vkSignalSemaphoreKHR) ||
+               (call_id == format::ApiCall_vkQueueBindSparse) || (call_id == format::ApiCall_vkDestroySemaphore) ||
+               (call_id == format::ApiCall_vkDestroyDevice);
+    }
+
     static bool Follows(format::ApiCallId call_id)
     {
         switch (call_id)
@@ -1401,6 +1492,49 @@ class VulkanLaneGpuObserver : public VulkanConsumer
                 return true;
             default:
                 return false;
+        }
+    }
+
+    void Process_vkSignalSemaphore(const ApiCallInfo& call_info, args::SignalSemaphore& args) override
+    {
+        SignalSemaphore(args.pSignalInfo);
+    }
+
+    void Process_vkSignalSemaphoreKHR(const ApiCallInfo& call_info, args::SignalSemaphoreKHR& args) override
+    {
+        SignalSemaphore(args.pSignalInfo);
+    }
+
+    void Process_vkQueueBindSparse(const ApiCallInfo& call_info, args::QueueBindSparse& args) override
+    {
+        const Decoded_VkBindSparseInfo* meta = args.pBindInfo.GetMetaStructPointer();
+        const VkBindSparseInfo*         bind = args.pBindInfo.GetPointer();
+        for (uint32_t i = 0; (meta != nullptr) && (bind != nullptr) && (i < args.bindInfoCount); ++i)
+        {
+            const format::HandleId* ids = meta[i].pSignalSemaphores.GetPointer();
+            for (uint32_t j = 0; (ids != nullptr) && (j < bind[i].signalSemaphoreCount); ++j)
+            {
+                const VulkanSemaphoreInfo* info = consumer_->GetLaneObjectTable().GetVkSemaphoreInfo(ids[j]);
+                if (info != nullptr)
+                {
+                    tracker_->NoteHostSignal(info->handle, UINT64_MAX);
+                }
+            }
+        }
+    }
+
+    void Process_vkDestroyDevice(const ApiCallInfo& call_info, args::DestroyDevice& args) override
+    {
+        // The semaphores of the device go, and their handles may come back
+        tracker_->ForgetSemaphores();
+    }
+
+    void Process_vkDestroySemaphore(const ApiCallInfo& call_info, args::DestroySemaphore& args) override
+    {
+        const VulkanSemaphoreInfo* info = consumer_->GetLaneObjectTable().GetVkSemaphoreInfo(args.semaphore);
+        if (info != nullptr)
+        {
+            tracker_->ForgetSemaphore(info->handle);
         }
     }
 
@@ -1464,6 +1598,18 @@ class VulkanLaneGpuObserver : public VulkanConsumer
             }
         }
         tracker_->BeforeQueryPoolUse(pool_id);
+    }
+
+    void SignalSemaphore(StructPointerDecoder<Decoded_VkSemaphoreSignalInfo>& signal_info)
+    {
+        const Decoded_VkSemaphoreSignalInfo* meta  = signal_info.GetMetaStructPointer();
+        const VkSemaphoreSignalInfo*         value = signal_info.GetPointer();
+        const VulkanSemaphoreInfo*           info =
+            (meta != nullptr) ? consumer_->GetLaneObjectTable().GetVkSemaphoreInfo(meta->semaphore) : nullptr;
+        if ((info != nullptr) && (value != nullptr))
+        {
+            tracker_->NoteHostSignal(info->handle, value->value);
+        }
     }
 
     VulkanReplayConsumerBase* consumer_;

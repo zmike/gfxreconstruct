@@ -59,6 +59,7 @@
 #include "vulkan/vulkan.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <functional>
@@ -109,8 +110,6 @@ class VulkanReplayConsumerBase : public VulkanConsumer
 
     virtual void WaitDevicesIdle() override;
 
-    // False once replay needs the commands recorded in stream order on the dispatch thread: for resource dumping, and
-    // when a device uses buffer device addresses that the address replacer remaps while commands are recorded.
     format::HandleId GetCommandBufferPoolId(format::HandleId command_buffer_id) const
     {
         const VulkanCommandBufferInfo* info = object_info_table_->GetVkCommandBufferInfo(command_buffer_id);
@@ -129,10 +128,15 @@ class VulkanReplayConsumerBase : public VulkanConsumer
 
     bool IgnoresQueryResults() const { return options_.ignore_query_results; }
 
+    // False once replay needs the commands recorded in stream order on the dispatch thread: for resource dumping, and
+    // when a device uses buffer device addresses that the address replacer remaps while commands are recorded.
     bool RecordLaneAllowed() const
     {
+        // The options that follow the position in the stream do so on the thread that reads it
         return !options_.dumping_resources && !options_.isolate_render_passes && !bda_device_created_ &&
-               !lane_unsupported_allocator_;
+               !lane_unsupported_allocator_ && !screenshot_json_ &&
+               (options_.skip_get_fence_status == SkipGetFenceStatus::NoSkip) && (options_.wait_before_frame == 0) &&
+               (options_.wait_before_first_submit == 0) && (options_.frame_warm_up_load == 0);
     }
 
     // What the GPU reads is tracked in captured memory space, which the rebind allocator provides.
@@ -2522,11 +2526,12 @@ class VulkanReplayConsumerBase : public VulkanConsumer
     // data), so we ignore those semaphores when they are encountered.
     bool have_imported_semaphores_;
 
-    // set once any vkCmdSetEvent/vkCmdResetEvent is recorded, gating the submit-time event-state walk
-    bool track_event_state_ = false;
+    // set once any vkCmdSetEvent/vkCmdResetEvent is recorded, gating the submit-time event-state walk. Atomic because
+    // the record lane sets it while the gpu lane reads it.
+    std::atomic<bool> track_event_state_{ false };
 
     // set once any device query op is recorded, gating the submit-time query-availability walk
-    bool track_query_state_ = false;
+    std::atomic<bool> track_query_state_{ false };
 
     // Used to track if any shadow sync objects are active to avoid checking if not needed.
     // SHadowed objects are ignored when they would have been unsignaled (waited on).

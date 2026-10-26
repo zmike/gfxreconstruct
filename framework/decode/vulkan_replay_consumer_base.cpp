@@ -8811,6 +8811,12 @@ VkResult VulkanReplayConsumerBase::OverrideSetDebugUtilsObjectNameEXT(
     // a VkPipeline is currently being compiled asynchronously -> defer setting the debug-name
     if (info->objectType == VK_OBJECT_TYPE_PIPELINE && IsUsedByAsyncTask(meta_info->objectHandle))
     {
+        if (lane_tracker_ != nullptr)
+        {
+            // The deferred name looks the pipeline up on the thread that reads the stream, while a lane may be
+            // waiting for the same pipeline. Debug names are not part of what the replay produces.
+            return original_result;
+        }
         format::HandleId     pipeline_id = meta_info->objectHandle;
         size_t               info_size   = graphics::vulkan_struct_deep_copy(info, 1, nullptr);
         std::vector<uint8_t> info_copy(info_size);
@@ -14557,10 +14563,9 @@ bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCa
         }
     }
 
-    // The buffer descriptors are only used when dumping or by the address replacer, which has nothing to replace on
-    // devices without bufferDeviceAddress
-    if (options_.dumping_resources ||
-        (UseAddressReplacement(device_info) && device_info->property_feature_info.feature_bufferDeviceAddress))
+    // The buffer descriptors are only used by the address replacer, which has nothing to replace on devices without
+    // bufferDeviceAddress. Dumping takes the decoded path above.
+    if (UseAddressReplacement(device_info) && device_info->property_feature_info.feature_bufferDeviceAddress)
     {
         for (size_t w = 0; w < scratch.writes.size(); ++w)
         {
