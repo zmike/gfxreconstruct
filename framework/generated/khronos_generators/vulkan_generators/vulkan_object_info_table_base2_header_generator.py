@@ -57,6 +57,8 @@ class VulkanObjectInfoTableBase2HeaderGeneratorOptions(VulkanBaseGeneratorOption
 # Generates declarations for functions for Vulkan object info table
 class VulkanObjectInfoTableBase2HeaderGenerator(KhronosObjectInfoTableHeaderGenerator, VulkanBaseGenerator):
 
+    OBJECT_INFO_MAP = 'ObjectInfoMap'
+
     def __init__(
         self, err_file=sys.stderr, warn_file=sys.stderr, diag_file=sys.stdout
     ):

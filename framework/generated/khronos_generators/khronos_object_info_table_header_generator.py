@@ -25,6 +25,9 @@ from khronos_base_generator import write
 # Generates declarations for functions for Khronos state table
 class KhronosObjectInfoTableHeaderGenerator():
 
+    # Template of the maps from handle IDs to object infos
+    OBJECT_INFO_MAP = 'std::unordered_map'
+
     # yapf: disable
     def generate_info_table(self, api_data, class_name, base_class):
         add_code = ''
@@ -53,7 +56,7 @@ class KhronosObjectInfoTableHeaderGenerator():
             const_get_code += '    const {api}{handle}* Get{function}(format::HandleId id) const {{ return Get{type}ObjectInfo<{api}{handle}>(id, &{map}); }}\n'.format(**info)
             get_code += '    {api}{handle}* Get{function}(format::HandleId id) {{ return Get{type}ObjectInfo<{api}{handle}>(id, &{map}); }}\n'.format(**info)
             visit_code += '    void Visit{function}(std::function<void(const {api}{handle}*)> visitor) const {{  for (const auto& entry : {map}) {{ visitor(&entry.second); }}  }}\n'.format(**info)
-            map_code += '     std::unordered_map<format::HandleId, {api}{handle}> {map};\n'.format(**info)
+            map_code += '     {map_type}<format::HandleId, {api}{handle}> {map};\n'.format(map_type=self.OBJECT_INFO_MAP, **info)
 
         code = '\n'
         code += f'class {class_name} : {base_class}\n'
