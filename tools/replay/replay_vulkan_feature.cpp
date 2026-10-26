@@ -35,6 +35,7 @@
 #include "plugin/replay_event_plugin_loader.h"
 #include "util/api_version_info.h"
 #include "util/feature_module_registry.h"
+#include "decode/vulkan_lane_decoder.h"
 #include "decode/vulkan_state_recording_decoder.h"
 
 // Headers for the Vulkan-only option parsing that this file owns.
@@ -90,6 +91,7 @@ const char kEnableUseCapturedSwapchainIndices[] =
     "--use-captured-swapchain-indices"; // The same: util::SwapchainOption::kCaptured
 const char kVirtualSwapchainSkipBlitShortOption[] = "--vssb";
 const char kVirtualSwapchainSkipBlitLongOption[]  = "--virtual-swapchain-skip-blit";
+const char kRecordLaneOption[]                    = "--record-lane";
 const char kColorspaceFallback[]                  = "--use-colorspace-fallback";
 const char kOffscreenSwapchainFrameBoundary[]     = "--offscreen-swapchain-frame-boundary";
 // The short forms of the two skip-get-fence entries.
@@ -355,6 +357,8 @@ GetVulkanReplayOptions(const gfxrecon::util::ArgumentParser&           arg_parse
         replay_options.virtual_swapchain_skip_blit = true;
     }
 
+    replay_options.record_lane = arg_parser.IsOptionSet(kRecordLaneOption);
+
     const std::string debug_severity_string = arg_parser.GetArgumentValue(kDebugMessageSeverityArgument);
     if (!debug_severity_string.empty())
     {
@@ -603,6 +607,11 @@ std::vector<util::FeatureOptionDesc> ReplayVulkanFeature::GetOptionDescs() const
                false,
                AliasNames(kVirtualSwapchainSkipBlitShortOption, kVirtualSwapchainSkipBlitLongOption) },
              { "",
+               { "Record command buffers on a second thread while the replay goes on with memory writes and",
+                 "descriptor updates." },
+               false,
+               kRecordLaneOption },
+             { "",
                { "The same as \"--swapchain captured\".",
                  "Replay ignores this entry when the \"--swapchain\" entry is present." },
                false,
@@ -802,6 +811,12 @@ void ReplayVulkanFeature::RegisterDecodeComponents(graphics::FpsInfo* fps_info)
             consumer->SetDecoder(decoder.get());
             RegisterConsumerAndDecoder(fps_info, std::move(decoder));
         }
+        else if (replay_options_.record_lane)
+        {
+            auto* consumer = dynamic_cast<decode::VulkanReplayConsumerBase*>(replay_consumer_.get());
+            GFXRECON_ASSERT(consumer != nullptr);
+            RegisterConsumerAndDecoder(fps_info, std::make_unique<decode::VulkanLaneDecoder>(consumer));
+        }
         else
         {
             RegisterConsumerAndDecoder(fps_info);
@@ -859,6 +874,12 @@ void ReplayVulkanFeature::CompletePreProcessingPass()
 
 void ReplayVulkanFeature::Destroy()
 {
+    // Calls that the decoder still holds on other threads use the consumer
+    if (decoder_ != nullptr)
+    {
+        decoder_->WaitIdle();
+    }
+
     replay_consumer_.reset();
 
 #if defined(GFXRECON_ENABLE_VULKAN)

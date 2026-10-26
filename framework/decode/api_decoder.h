@@ -59,6 +59,10 @@ class ApiDecoder
 
     virtual void StartLooping() {}
 
+    // Called before every block other than a function call or a memory fill is dispatched to the decoder, so that a
+    // decoder that postpones work can complete it first.
+    virtual void PreDispatchBarrier() {}
+
     virtual bool IsComplete(uint64_t block_index) = 0;
 
     virtual bool SupportsApiCall(format::ApiCallId id) = 0;

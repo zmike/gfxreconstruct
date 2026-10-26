@@ -210,6 +210,14 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     virtual VkResult
     WriteMappedMemoryRange(MemoryData allocator_data, uint64_t offset, uint64_t size, const uint8_t* data) override;
 
+    // Where a buffer sits in the captured memory it is bound to: the capture id of the memory and the offset in it.
+    // False when the buffer is not bound to one captured memory.
+    bool GetBufferBinding(ResourceData allocator_data, VkBuffer buffer, uint64_t* memory_id, VkDeviceSize* offset) const;
+
+    // The offset that WriteMappedMemoryRange offsets are relative to, and if asked for, whether only buffers are bound
+    // to the memory.
+    bool GetMappedWriteTarget(MemoryData allocator_data, VkDeviceSize* mapped_offset, bool* only_buffers) const;
+
     virtual void ReportAllocateMemoryIncompatibility(const VkMemoryAllocateInfo* allocate_info) override;
 
     virtual void ReportBindBufferIncompatibility(VkBuffer     buffer,

@@ -63,7 +63,7 @@ class DecodeAllocator
 
   private:
     static const size_t     kAllocatorBlockSize{ 64 * 1024 };
-    static DecodeAllocator* instance_;
+    static thread_local DecodeAllocator* instance_;
 
     util::MonotonicAllocator allocator_;
     bool                     can_allocate_;
