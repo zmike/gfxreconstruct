@@ -210,6 +210,16 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     virtual VkResult
     WriteMappedMemoryRange(MemoryData allocator_data, uint64_t offset, uint64_t size, const uint8_t* data) override;
 
+    // Lets the calling thread leave the shadow copy of the memory writes it replays to WriteShadowCopy on another
+    // thread.
+    static void SetShadowCopyElsewhere(bool elsewhere);
+
+    // The part of WriteMappedMemoryRange that keeps the original content for resources bound to the range later, for a
+    // memory that is mapped at mapped_offset. The caller follows the mapping, which the thread that replays the writes
+    // changes.
+    VkResult WriteShadowCopy(
+        MemoryData allocator_data, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data);
+
     // Where a buffer sits in the captured memory it is bound to: the capture id of the memory and the offset in it.
     // False when the buffer is not bound to one captured memory.
     bool GetBufferBinding(ResourceData allocator_data, VkBuffer buffer, uint64_t* memory_id, VkDeviceSize* offset) const;
@@ -414,6 +424,9 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     static std::unique_ptr<uint8_t[], ZeroedBufferDeleter> AllocateZeroedBuffer(size_t size);
 
     struct MemoryAllocInfo;
+
+    static VkResult EnsureShadowCopy(MemoryAllocInfo* memory_alloc_info);
+    static void CopyToShadow(MemoryAllocInfo* memory_alloc_info, uint64_t position, uint64_t size, const uint8_t* data);
 
     struct SubresourceLayouts
     {

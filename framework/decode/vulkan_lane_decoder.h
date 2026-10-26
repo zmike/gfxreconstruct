@@ -26,6 +26,7 @@
 #include "decode/decode_allocator.h"
 #include "decode/value_decoder.h"
 #include "decode/vulkan_lane_tracker.h"
+#include "decode/vulkan_rebind_allocator.h"
 #include "decode/vulkan_replay_consumer_base.h"
 #include "format/api_call_id.h"
 #include "generated/generated_vulkan_decoder.h"
@@ -84,6 +85,7 @@ class VulkanLaneDecoder : public VulkanDecoder
                             size_t             buffer_size) override
     {
         PrepareHelpers();
+        NoteMapping(call_id, parameter_buffer, buffer_size);
         if (UseLanes())
         {
             switch (Classify(call_id))
@@ -139,11 +141,22 @@ class VulkanLaneDecoder : public VulkanDecoder
     void DispatchFillMemoryCommand(
         format::ThreadId thread_id, uint64_t memory_id, uint64_t offset, uint64_t size, const uint8_t* data) override
     {
-        if (UseLanes())
+        // A fill that cannot fit the ring is replayed here, which makes its own shadow copy
+        if (UseLanes() && (size + 4096 <= kRingSize / 4))
         {
             PrepareHelpers();
-            uint64_t header[3] = { memory_id, offset, size };
-            if (Enqueue(gpu_, format::ApiCallId::ApiCall_Unknown, ApiCallInfo{}, reinterpret_cast<uint8_t*>(header), sizeof(header), kFill, 0, data, size))
+            // The shadow copy is made here when the mapping is known, since the gpu lane changes it later
+            const bool shadow_done = CopyFillShadow(memory_id, offset, size, data);
+            uint64_t   header[4]   = { memory_id, offset, size, shadow_done ? 1u : 0u };
+            if (Enqueue(gpu_,
+                        format::ApiCallId::ApiCall_Unknown,
+                        ApiCallInfo{},
+                        reinterpret_cast<uint8_t*>(header),
+                        sizeof(header),
+                        kFill,
+                        0,
+                        data,
+                        size))
             {
                 return;
             }
@@ -589,6 +602,54 @@ class VulkanLaneDecoder : public VulkanDecoder
         }
     }
 
+    // Follows the mapping of memory in call order, since the gpu lane replays the calls that change it later
+    void NoteMapping(format::ApiCallId call_id, const uint8_t* parameters, size_t size)
+    {
+        switch (call_id)
+        {
+            case format::ApiCall_vkMapMemory:
+            {
+                // vkMapMemory(device, memory, offset, ...)
+                format::HandleId ids[2] = {};
+                size_t           read   = ValueDecoder::DecodeHandleIdValue(parameters, size, &ids[0]);
+                read += ValueDecoder::DecodeHandleIdValue(parameters + read, size - read, &ids[1]);
+                uint64_t offset = 0;
+                ValueDecoder::DecodeUInt64Value(parameters + read, size - read, &offset);
+                mapped_offsets_[ids[1]] = offset;
+                break;
+            }
+            case format::ApiCall_vkUnmapMemory:
+            {
+                format::HandleId ids[2] = {};
+                size_t           read   = ValueDecoder::DecodeHandleIdValue(parameters, size, &ids[0]);
+                ValueDecoder::DecodeHandleIdValue(parameters + read, size - read, &ids[1]);
+                mapped_offsets_.erase(ids[1]);
+                break;
+            }
+            case format::ApiCall_vkMapMemory2:
+            case format::ApiCall_vkMapMemory2KHR:
+            case format::ApiCall_vkUnmapMemory2:
+            case format::ApiCall_vkUnmapMemory2KHR:
+                // Not followed
+                mapping_followed_ = false;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // The shadow copy of a fill, if the memory is known to be mapped. False if the gpu lane has to make it.
+    bool CopyFillShadow(uint64_t memory_id, uint64_t offset, uint64_t size, const uint8_t* data)
+    {
+        if (!mapping_followed_)
+        {
+            return false;
+        }
+        auto it = mapped_offsets_.find(memory_id);
+        return (it != mapped_offsets_.end()) &&
+               consumer_->CopyLaneFillShadow(memory_id, it->second, offset, size, data);
+    }
+
     // Before a call is replayed on the dispatch thread, which has the object tables to itself
     void BeforeInline()
     {
@@ -837,8 +898,10 @@ class VulkanLaneDecoder : public VulkanDecoder
                     {
                         const uint64_t* header = reinterpret_cast<const uint64_t*>(parameters);
                         tracker_.BeforeFill(header[0], header[1], header[2]);
+                        VulkanRebindAllocator::SetShadowCopyElsewhere(header[3] != 0);
                         lane.decoder.DispatchFillMemoryCommand(
                             0, header[0], header[1], header[2], parameters + entry->parameter_size);
+                        VulkanRebindAllocator::SetShadowCopyElsewhere(false);
                         break;
                     }
                     case kParkedReset:
@@ -885,6 +948,8 @@ class VulkanLaneDecoder : public VulkanDecoder
     VulkanLaneTracker         tracker_;
     VulkanLaneRecordObserver  observer_;
     VulkanLaneGpuObserver     gpu_observer_;
+    std::unordered_map<format::HandleId, uint64_t> mapped_offsets_; ///< Mapped memory, at the offset it is mapped at
+    bool                                           mapping_followed_{ true };
     VulkanDecoder             gpu_peek_;
     bool                      lanes_off_{ false };
     bool                      flush_needed_{ false };

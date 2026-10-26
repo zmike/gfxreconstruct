@@ -14212,30 +14212,33 @@ VulkanReplayConsumerBase::LaneBufferBase VulkanReplayConsumerBase::GetLaneBuffer
     return base;
 }
 
+VulkanRebindAllocator* VulkanReplayConsumerBase::GetLaneRebindAllocator(const VulkanDeviceMemoryInfo* memory_info) const
+{
+    return (memory_info != nullptr) ? dynamic_cast<VulkanRebindAllocator*>(memory_info->allocator) : nullptr;
+}
+
 bool VulkanReplayConsumerBase::GetLaneMappedWriteTarget(format::HandleId memory_id,
                                                         uint64_t*        mapped_offset,
                                                         bool*            only_buffers) const
 {
     const VulkanDeviceMemoryInfo* memory_info = object_info_table_->GetVkDeviceMemoryInfo(memory_id);
-    if (memory_info == nullptr)
-    {
-        return false;
-    }
-
-    const VulkanDeviceInfo* device_info = object_info_table_->GetVkDeviceInfo(memory_info->parent_id);
-    if (device_info == nullptr)
-    {
-        return false;
-    }
-
-    const auto* allocator = dynamic_cast<const VulkanRebindAllocator*>(device_info->allocator.get());
-    VkDeviceSize offset   = 0;
+    const VulkanRebindAllocator*  allocator   = GetLaneRebindAllocator(memory_info);
+    VkDeviceSize                  offset      = 0;
     if ((allocator == nullptr) || !allocator->GetMappedWriteTarget(memory_info->allocator_data, &offset, only_buffers))
     {
         return false;
     }
     *mapped_offset = offset;
     return true;
+}
+
+bool VulkanReplayConsumerBase::CopyLaneFillShadow(
+    format::HandleId memory_id, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data)
+{
+    const VulkanDeviceMemoryInfo* memory_info = object_info_table_->GetVkDeviceMemoryInfo(memory_id);
+    VulkanRebindAllocator*        allocator   = GetLaneRebindAllocator(memory_info);
+    return (allocator != nullptr) &&
+           (allocator->WriteShadowCopy(memory_info->allocator_data, mapped_offset, offset, size, data) == VK_SUCCESS);
 }
 
 void VulkanReplayConsumerBase::WaitSemaphoresNow(VkDevice device, const VkSemaphoreWaitInfo& wait_info)
