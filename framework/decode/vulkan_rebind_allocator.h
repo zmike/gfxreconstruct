@@ -29,10 +29,12 @@
 
 #include "vk_mem_alloc.h"
 
+#include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <unordered_map>
 
@@ -219,6 +221,29 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     // changes.
     VkResult WriteShadowCopy(
         MemoryData allocator_data, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data);
+
+    // Lets the calling thread have the writes it replays to mapped memory staged: the data goes to a staging buffer
+    // and a copy to the buffers bound to the range is put off to SubmitStagedFills, so the host does not write
+    // memory that the GPU may still be reading. The caller checks CanStageFill for each write.
+    static void SetStageFills(bool stage);
+
+    // True if the write of size bytes at position in the captured memory can be staged: every resource it reaches is a
+    // buffer in mapped memory that takes a copy. Reserves staging space for the write, which the next write
+    // replayed with SetStageFills takes. The bytes it needs are returned, which are none when no resource is
+    // bound to the range.
+    bool CanStageFill(MemoryData allocator_data, uint64_t position, uint64_t size, uint64_t* staged_bytes);
+
+    // Submits the copies of the writes staged so far on the queue to run after everything submitted to it before,
+    // and signals the semaphore to the value. False if no write was staged or the copies cannot be submitted.
+    bool SubmitStagedFills(VkQueue queue, uint32_t queue_family, VkSemaphore* semaphore, uint64_t* value);
+
+    // Makes the copies staged after this wait for those staged before it, for writes to bytes that buffers share.
+    void StageOrder();
+
+    // Has the pool reset by a command in the next SubmitStagedFills. False if that is not possible.
+    bool StageQueryReset(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count);
+
+    VkDevice GetDevice() const { return device_; }
 
     // Where a buffer sits in the captured memory it is bound to: the capture id of the memory and the offset in it.
     // False when the buffer is not bound to one captured memory.
@@ -428,6 +453,27 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     static VkResult EnsureShadowCopy(MemoryAllocInfo* memory_alloc_info);
     static void CopyToShadow(MemoryAllocInfo* memory_alloc_info, uint64_t position, uint64_t size, const uint8_t* data);
 
+    // Writes to mapped memory that wait for a copy to the buffers they are meant for
+    struct StagedCopy
+    {
+        VkBuffer     buffer;
+        VkDeviceSize buffer_offset;
+        VkDeviceSize ring_offset;
+        VkDeviceSize size;
+    };
+
+    // Ring space of staged writes: open until the copies that read it are submitted, in use until they finished
+    struct StageSegment
+    {
+        VkDeviceSize begin;
+        VkDeviceSize end;
+        uint64_t     value; // 0 while open
+    };
+
+    bool CreateFillStage();
+    bool ReserveFillStage(VkDeviceSize size, VkDeviceSize* offset);
+    void RetireFillStage();
+
     struct SubresourceLayouts
     {
         VkImageSubresource  subresource{};
@@ -612,6 +658,16 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
         size_t             dst_offset;
         VkFence            staging_fence;
     };
+
+    bool StageableBuffer(const ResourceAllocInfo* resource_alloc_info,
+                         const VmaMemoryInfo*     bound_memory_info,
+                         VkBuffer*                buffer) const;
+    bool StageBoundBuffer(ResourceAllocInfo* resource_alloc_info,
+                          VmaMemoryInfo*     bound_memory_info,
+                          VkDeviceSize       src_offset,
+                          VkDeviceSize       dst_offset,
+                          VkDeviceSize       data_size,
+                          const uint8_t*     data);
 
     void WriteBoundResource(ResourceAllocInfo* resource_alloc_info,
                             VmaMemoryInfo*     bound_memory_info,
@@ -831,6 +887,23 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
     uint32_t min_buffer_alignment_ = 128;
 
     std::vector<StagingResources> staging_resources_{};
+
+    // Staged writes, which only the thread that replays them touches
+    VkBuffer                                                 fill_ring_{ VK_NULL_HANDLE };
+    VmaAllocation                                            fill_ring_alloc_{ VK_NULL_HANDLE };
+    uint8_t*                                                 fill_ring_pointer_{ nullptr };
+    VkDeviceSize                                             fill_ring_head_{ 0 };
+    std::deque<StageSegment>                                 fill_segments_;
+    std::vector<StagedCopy>                                  staged_copies_;
+    std::vector<std::tuple<VkQueryPool, uint32_t, uint32_t>> staged_query_resets_;
+    VkDeviceSize                                             fill_reserved_offset_{ 0 };
+    VkDeviceSize                                             fill_reserved_left_{ 0 };
+    VkSemaphore                                              fill_semaphore_{ VK_NULL_HANDLE };
+    uint64_t                                                 fill_value_{ 0 };
+    VkCommandPool                                            fill_pool_{ VK_NULL_HANDLE };
+    std::deque<std::pair<VkCommandBuffer, uint64_t>>         fill_command_buffers_;
+    std::vector<VkCommandBuffer>                             fill_free_command_buffers_;
+    bool                                                     fill_stage_failed_{ false };
 
     // external per-block mutexes replacing VmaDeviceMemoryBlock::m_MapAndBindMutex (now private in VMA 3.3.0).
     // use VkDeviceMemory-handles as key to cover all allocations sharing the same block.

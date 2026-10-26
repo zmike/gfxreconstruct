@@ -123,6 +123,12 @@ class VulkanReplayConsumerBase : public VulkanConsumer
     // at once.
     void PrepareLaneHelpers();
 
+    // True if replay leaves out vkGetQueryPoolResults for the pool, as it does by request unless the replay itself
+    // needs the results.
+    bool SkipsQueryResults(const VulkanDeviceInfo* device_info, VkQueryPool query_pool);
+
+    bool IgnoresQueryResults() const { return options_.ignore_query_results; }
+
     bool RecordLaneAllowed() const
     {
         return !options_.dumping_resources && !options_.isolate_render_passes && !bda_device_created_ &&
@@ -148,6 +154,10 @@ class VulkanReplayConsumerBase : public VulkanConsumer
         format::HandleId memory_id, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data);
 
     VulkanRebindAllocator* GetLaneRebindAllocator(const VulkanDeviceMemoryInfo* memory_info) const;
+
+    // The rebind allocator of a memory and its data for the memory, or null
+    VulkanRebindAllocator* GetLaneFillAllocator(format::HandleId                     memory_id,
+                                                VulkanResourceAllocator::MemoryData* allocator_data) const;
 
     const CommonObjectInfoTable& GetLaneObjectTable() const { return *object_info_table_; }
 

@@ -283,6 +283,23 @@ void VulkanRebindAllocator::Destroy()
         injected->DestroyCommandPool(device_, cmd_pool_, nullptr);
     }
 
+    if (fill_semaphore_ != VK_NULL_HANDLE)
+    {
+        injected->DeviceWaitIdle(device_);
+        injected->DestroyCommandPool(device_, fill_pool_, nullptr);
+        injected->DestroySemaphore(device_, fill_semaphore_, nullptr);
+        fill_pool_      = VK_NULL_HANDLE;
+        fill_semaphore_ = VK_NULL_HANDLE;
+        fill_command_buffers_.clear();
+        fill_free_command_buffers_.clear();
+    }
+    if (fill_ring_ != VK_NULL_HANDLE)
+    {
+        util::MarkInjectedCommandsHelper injected_vma;
+        vmaDestroyBuffer(allocator_, fill_ring_, fill_ring_alloc_);
+        fill_ring_ = VK_NULL_HANDLE;
+    }
+
     if (allocator_ != VK_NULL_HANDLE)
     {
         vmaDestroyAllocator(allocator_);
@@ -2058,6 +2075,7 @@ VulkanRebindAllocator::AllocateZeroedBuffer(size_t size)
 }
 
 static thread_local bool shadow_copy_elsewhere = false;
+static thread_local bool stage_fills           = false;
 
 void VulkanRebindAllocator::SetShadowCopyElsewhere(bool elsewhere)
 {
@@ -2169,6 +2187,431 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
     }
 
     return result;
+}
+
+void VulkanRebindAllocator::SetStageFills(bool stage)
+{
+    stage_fills = stage;
+}
+
+static constexpr VkDeviceSize kFillRingSize  = 32u << 20;
+static constexpr VkDeviceSize kFillAlignment = 64;
+
+bool VulkanRebindAllocator::CreateFillStage()
+{
+    if (fill_ring_ != VK_NULL_HANDLE)
+    {
+        return true;
+    }
+    if (fill_stage_failed_ || (allocator_ == VK_NULL_HANDLE))
+    {
+        return false;
+    }
+    fill_stage_failed_ = true;
+
+    auto injected = device_table_.Open();
+
+    VkSemaphoreTypeCreateInfo type_info{};
+    type_info.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+    type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo semaphore_info{};
+    semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semaphore_info.pNext = &type_info;
+    if (injected->CreateSemaphore(device_, &semaphore_info, nullptr, &fill_semaphore_) != VK_SUCCESS)
+    {
+        fill_semaphore_ = VK_NULL_HANDLE;
+        return false;
+    }
+
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size  = kFillRingSize;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+    VmaAllocationCreateInfo alloc_info{};
+    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    alloc_info.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+
+    VmaAllocationInfo ring_info{};
+    VkResult          result;
+    {
+        util::MarkInjectedCommandsHelper injected_vma;
+        result = vmaCreateBuffer(allocator_, &buffer_info, &alloc_info, &fill_ring_, &fill_ring_alloc_, &ring_info);
+    }
+    if ((result != VK_SUCCESS) || (ring_info.pMappedData == nullptr))
+    {
+        if (result == VK_SUCCESS)
+        {
+            util::MarkInjectedCommandsHelper injected_vma;
+            vmaDestroyBuffer(allocator_, fill_ring_, fill_ring_alloc_);
+        }
+        fill_ring_ = VK_NULL_HANDLE;
+        injected->DestroySemaphore(device_, fill_semaphore_, nullptr);
+        fill_semaphore_ = VK_NULL_HANDLE;
+        return false;
+    }
+    fill_ring_pointer_ = static_cast<uint8_t*>(ring_info.pMappedData);
+    fill_stage_failed_ = false;
+    return true;
+}
+
+void VulkanRebindAllocator::RetireFillStage()
+{
+    uint64_t completed = 0;
+    auto     injected  = device_table_.Open();
+    injected->GetSemaphoreCounterValue(device_, fill_semaphore_, &completed);
+    while (!fill_segments_.empty() && (fill_segments_.front().value != 0) &&
+           (fill_segments_.front().value <= completed))
+    {
+        fill_segments_.pop_front();
+    }
+    if (fill_pool_ != VK_NULL_HANDLE)
+    {
+        while (!fill_command_buffers_.empty() && (fill_command_buffers_.front().second <= completed))
+        {
+            fill_free_command_buffers_.push_back(fill_command_buffers_.front().first);
+            fill_command_buffers_.pop_front();
+        }
+    }
+}
+
+bool VulkanRebindAllocator::ReserveFillStage(VkDeviceSize size, VkDeviceSize* offset)
+{
+    if (fill_segments_.empty())
+    {
+        fill_ring_head_ = 0;
+    }
+
+    const VkDeviceSize tail = fill_segments_.empty() ? 0 : fill_segments_.front().begin;
+    VkDeviceSize       begin;
+    if (fill_segments_.empty() || (fill_ring_head_ > tail))
+    {
+        if (fill_ring_head_ + size <= kFillRingSize)
+        {
+            begin = fill_ring_head_;
+        }
+        else if (size < tail)
+        {
+            begin = 0;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else if (fill_ring_head_ + size < tail)
+    {
+        begin = fill_ring_head_;
+    }
+    else
+    {
+        return false;
+    }
+
+    // Space is open until the copies are submitted. A wrapped reservation starts a new segment.
+    if (!fill_segments_.empty() && (fill_segments_.back().value == 0) && (fill_segments_.back().end == begin))
+    {
+        fill_segments_.back().end = begin + size;
+    }
+    else
+    {
+        fill_segments_.push_back({ begin, begin + size, 0 });
+    }
+    fill_ring_head_ = begin + size;
+    *offset         = begin;
+    return true;
+}
+
+bool VulkanRebindAllocator::StageableBuffer(const ResourceAllocInfo* resource_alloc_info,
+                                            const VmaMemoryInfo*     bound_memory_info,
+                                            VkBuffer*                buffer) const
+{
+    if ((resource_alloc_info->object_type != VK_OBJECT_TYPE_BUFFER) ||
+        ((resource_alloc_info->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) == 0) || !bound_memory_info->is_host_visible ||
+        (bound_memory_info->mapped_pointer == nullptr) || (bound_memory_info->memory_info == nullptr))
+    {
+        return false;
+    }
+    if (buffer == nullptr)
+    {
+        return true;
+    }
+    for (const auto& entry : bound_memory_info->memory_info->original_objects)
+    {
+        if (entry.second == resource_alloc_info)
+        {
+            *buffer = UINT64_TO_VK_HANDLE(VkBuffer, entry.first);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VulkanRebindAllocator::CanStageFill(MemoryData allocator_data,
+                                         uint64_t   position,
+                                         uint64_t   size,
+                                         uint64_t*  staged_bytes)
+{
+    auto memory_alloc_info = reinterpret_cast<const MemoryAllocInfo*>(allocator_data);
+    if ((memory_alloc_info == nullptr) || !memory_alloc_info->is_mapped || !CreateFillStage())
+    {
+        return false;
+    }
+
+    uint64_t bytes = 0;
+    for (const auto& entry : memory_alloc_info->original_objects)
+    {
+        for (const auto* bound : entry.second->bound_memory_infos)
+        {
+            VkDeviceSize src_offset = 0;
+            VkDeviceSize dst_offset = 0;
+            VkDeviceSize data_size  = 0;
+            if (TranslateMemoryRange(bound, position, position + size, &src_offset, &dst_offset, &data_size))
+            {
+                VkBuffer buffer;
+                if (!StageableBuffer(entry.second, bound, &buffer))
+                {
+                    return false;
+                }
+                bytes += util::aligned_value(data_size, kFillAlignment);
+            }
+        }
+    }
+
+    *staged_bytes = bytes;
+    if (bytes == 0)
+    {
+        return true;
+    }
+    if (!ReserveFillStage(bytes, &fill_reserved_offset_))
+    {
+        // A copy that finished frees space
+        RetireFillStage();
+        if (!ReserveFillStage(bytes, &fill_reserved_offset_))
+        {
+            return false;
+        }
+    }
+    fill_reserved_left_ = bytes;
+    return true;
+}
+
+bool VulkanRebindAllocator::StageBoundBuffer(ResourceAllocInfo* resource_alloc_info,
+                                             VmaMemoryInfo*     bound_memory_info,
+                                             VkDeviceSize       src_offset,
+                                             VkDeviceSize       dst_offset,
+                                             VkDeviceSize       data_size,
+                                             const uint8_t*     data)
+{
+    VkBuffer           buffer;
+    const VkDeviceSize reserve = util::aligned_value(data_size, kFillAlignment);
+    if ((fill_reserved_left_ < reserve) || !StageableBuffer(resource_alloc_info, bound_memory_info, &buffer))
+    {
+        return false;
+    }
+
+    util::platform::MemoryCopy(fill_ring_pointer_ + fill_reserved_offset_, data_size, data + src_offset, data_size);
+    staged_copies_.push_back({ buffer, dst_offset, fill_reserved_offset_, data_size });
+    fill_reserved_offset_ += reserve;
+    fill_reserved_left_ -= reserve;
+    return true;
+}
+
+void VulkanRebindAllocator::StageOrder()
+{
+    // A copy without a buffer stands for a barrier
+    if (!staged_copies_.empty() && (staged_copies_.back().buffer != VK_NULL_HANDLE))
+    {
+        staged_copies_.push_back({ VK_NULL_HANDLE, 0, 0, 0 });
+    }
+}
+
+bool VulkanRebindAllocator::StageQueryReset(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count)
+{
+    if (!CreateFillStage())
+    {
+        return false;
+    }
+    staged_query_resets_.emplace_back(query_pool, first_query, query_count);
+    return true;
+}
+
+// The writes were taken from the application and the host cannot order them, so replay cannot go on
+[[noreturn]] static void FailStagedFills()
+{
+    GFXRECON_LOG_FATAL("Replay could not submit the copies of staged memory writes");
+    std::abort();
+}
+
+bool VulkanRebindAllocator::SubmitStagedFills(VkQueue      queue,
+                                              uint32_t     queue_family,
+                                              VkSemaphore* semaphore,
+                                              uint64_t*    value)
+{
+    if (staged_copies_.empty() && staged_query_resets_.empty())
+    {
+        return false;
+    }
+
+    auto injected = device_table_.Open();
+    RetireFillStage();
+
+    if (fill_pool_ == VK_NULL_HANDLE)
+    {
+        VkCommandPoolCreateInfo pool_info{};
+        pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pool_info.queueFamilyIndex = queue_family;
+        if (injected->CreateCommandPool(device_, &pool_info, nullptr, &fill_pool_) != VK_SUCCESS)
+        {
+            fill_pool_ = VK_NULL_HANDLE;
+            FailStagedFills();
+        }
+    }
+
+    // A finished copy command buffer is reused, which the pool's reset flag allows by begin
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    if (!fill_free_command_buffers_.empty())
+    {
+        command_buffer = fill_free_command_buffers_.back();
+        fill_free_command_buffers_.pop_back();
+    }
+    else
+    {
+        VkCommandBufferAllocateInfo allocate_info{};
+        allocate_info.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocate_info.commandPool        = fill_pool_;
+        allocate_info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate_info.commandBufferCount = 1;
+        if (injected->AllocateCommandBuffers(device_, &allocate_info, &command_buffer) != VK_SUCCESS)
+        {
+            FailStagedFills();
+        }
+    }
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    injected.BeginCommandBuffer(command_buffer, &begin_info, __func__);
+
+    // The GPU is done with what it reads before the copies write it, and reads the copies after
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    auto order    = [&](VkPipelineStageFlags src_stage,
+                        VkAccessFlags        src_access,
+                        VkPipelineStageFlags dst_stage,
+                        VkAccessFlags        dst_access) {
+        barrier.srcAccessMask = src_access;
+        barrier.dstAccessMask = dst_access;
+        injected->CmdPipelineBarrier(command_buffer, src_stage, dst_stage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    };
+    auto full_barrier = [&]() {
+        order(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+              VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+    };
+    full_barrier();
+
+    for (const auto& [query_pool, first_query, query_count] : staged_query_resets_)
+    {
+        injected->CmdResetQueryPool(command_buffer, query_pool, first_query, query_count);
+    }
+    staged_query_resets_.clear();
+
+    // Copies go in one go per buffer between the barriers that StageOrder puts in
+    struct Batch
+    {
+        VkBuffer                  buffer;
+        std::vector<VkBufferCopy> regions;
+    };
+    std::vector<Batch> batches;
+    auto               emit = [&]() {
+        for (const Batch& batch : batches)
+        {
+            injected->CmdCopyBuffer(command_buffer,
+                                    fill_ring_,
+                                    batch.buffer,
+                                    static_cast<uint32_t>(batch.regions.size()),
+                                    batch.regions.data());
+        }
+        batches.clear();
+    };
+    for (const StagedCopy& copy : staged_copies_)
+    {
+        if (copy.buffer == VK_NULL_HANDLE)
+        {
+            emit();
+            order(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT,
+                  VK_ACCESS_TRANSFER_WRITE_BIT);
+            continue;
+        }
+
+        Batch* batch = nullptr;
+        for (Batch& candidate : batches)
+        {
+            if (candidate.buffer == copy.buffer)
+            {
+                batch = &candidate;
+                break;
+            }
+        }
+        if (batch == nullptr)
+        {
+            batch         = &batches.emplace_back();
+            batch->buffer = copy.buffer;
+        }
+        batch->regions.push_back({ copy.ring_offset, copy.buffer_offset, copy.size });
+    }
+    emit();
+
+    full_barrier();
+    injected->EndCommandBuffer(command_buffer);
+
+    for (const StageSegment& segment : fill_segments_)
+    {
+        if (segment.value == 0)
+        {
+            vmaFlushAllocation(allocator_, fill_ring_alloc_, segment.begin, segment.end - segment.begin);
+        }
+    }
+
+    const uint64_t signal_value = ++fill_value_;
+
+    VkTimelineSemaphoreSubmitInfo timeline{};
+    timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline.signalSemaphoreValueCount = 1;
+    timeline.pSignalSemaphoreValues    = &signal_value;
+    VkSubmitInfo submit{};
+    submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.pNext                = &timeline;
+    submit.commandBufferCount   = 1;
+    submit.pCommandBuffers      = &command_buffer;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores    = &fill_semaphore_;
+    const VkResult result       = injected->QueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+
+    for (StageSegment& segment : fill_segments_)
+    {
+        if (segment.value == 0)
+        {
+            segment.value = signal_value;
+        }
+    }
+    fill_command_buffers_.emplace_back(command_buffer, signal_value);
+    staged_copies_.clear();
+    fill_reserved_left_ = 0;
+
+    if (result != VK_SUCCESS)
+    {
+        FailStagedFills();
+    }
+
+    *semaphore = fill_semaphore_;
+    *value     = signal_value;
+    return true;
 }
 
 bool VulkanRebindAllocator::GetBufferBinding(ResourceData  allocator_data,
@@ -2774,7 +3217,11 @@ void VulkanRebindAllocator::UpdateBoundResource(ResourceAllocInfo* resource_allo
 
     if (TranslateMemoryRange(bound_memory_info, write_start, write_end, &src_offset, &dst_offset, &data_size))
     {
-        WriteBoundResource(resource_alloc_info, bound_memory_info, src_offset, dst_offset, data_size, data);
+        if (!stage_fills ||
+            !StageBoundBuffer(resource_alloc_info, bound_memory_info, src_offset, dst_offset, data_size, data))
+        {
+            WriteBoundResource(resource_alloc_info, bound_memory_info, src_offset, dst_offset, data_size, data);
+        }
     }
 }
 
