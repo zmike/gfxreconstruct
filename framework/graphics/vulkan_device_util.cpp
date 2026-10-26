@@ -249,6 +249,7 @@ VulkanDeviceUtil::EnableRequiredPhysicalDeviceFeatures(const VulkanInstanceUtilI
                 auto vulkan_1_2_features = reinterpret_cast<VkPhysicalDeviceVulkan12Features*>(current_struct);
 
                 // Enable bufferDeviceAddressCaptureReplay if bufferDeviceAddress feature is enabled
+                result.feature_bufferDeviceAddress              = vulkan_1_2_features->bufferDeviceAddress;
                 result.feature_bufferDeviceAddressCaptureReplay = EnableRequiredBufferDeviceAddressFeatures(
                     instance_info, instance_table, physical_device, vulkan_1_2_features);
 
@@ -283,6 +284,7 @@ VulkanDeviceUtil::EnableRequiredPhysicalDeviceFeatures(const VulkanInstanceUtilI
             {
                 auto buffer_address_features =
                     reinterpret_cast<VkPhysicalDeviceBufferDeviceAddressFeatures*>(current_struct);
+                result.feature_bufferDeviceAddress              = buffer_address_features->bufferDeviceAddress;
                 result.feature_bufferDeviceAddressCaptureReplay = EnableRequiredBufferDeviceAddressFeatures(
                     instance_info, instance_table, physical_device, buffer_address_features);
             }

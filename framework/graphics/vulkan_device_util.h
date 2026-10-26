@@ -92,6 +92,7 @@ struct VulkanDevicePropertyFeatureInfo
     uint32_t property_shaderGroupHandleSize{ 0 };
     uint32_t property_shaderGroupHandleCaptureReplaySize{ 0 };
 
+    VkBool32 feature_bufferDeviceAddress{ VK_FALSE };
     VkBool32 feature_bufferDeviceAddressCaptureReplay{ VK_FALSE };
     VkBool32 feature_accelerationStructureCaptureReplay{ VK_FALSE };
     VkBool32 feature_rayTracingPipelineShaderGroupHandleCaptureReplay{ VK_FALSE };
