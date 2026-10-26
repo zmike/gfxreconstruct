@@ -26,7 +26,7 @@
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(decode)
 
-DecodeAllocator* DecodeAllocator::instance_{ nullptr };
+thread_local DecodeAllocator* DecodeAllocator::instance_{ nullptr };
 
 void DecodeAllocator::Begin()
 {

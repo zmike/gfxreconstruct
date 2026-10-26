@@ -2115,6 +2115,55 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
     return result;
 }
 
+bool VulkanRebindAllocator::GetBufferBinding(ResourceData  allocator_data,
+                                              VkBuffer      buffer,
+                                              uint64_t*     memory_id,
+                                              VkDeviceSize* offset) const
+{
+    auto resource_alloc_info = reinterpret_cast<const ResourceAllocInfo*>(allocator_data);
+    if ((resource_alloc_info == nullptr) || (resource_alloc_info->memory_info_type != kBasic) ||
+        (resource_alloc_info->bound_memory_infos.size() != 1))
+    {
+        return false;
+    }
+
+    const MemoryAllocInfo* memory_alloc_info = resource_alloc_info->bound_memory_infos[0]->memory_info;
+    const uint64_t         handle            = VK_HANDLE_TO_UINT64(buffer);
+    for (const auto& range : memory_alloc_info->bound_ranges)
+    {
+        if (range.object_handle == handle)
+        {
+            *memory_id = memory_alloc_info->capture_id;
+            *offset    = range.offset;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VulkanRebindAllocator::GetMappedWriteTarget(MemoryData    allocator_data,
+                                                 VkDeviceSize* mapped_offset,
+                                                 bool*         only_buffers) const
+{
+    auto memory_alloc_info = reinterpret_cast<const MemoryAllocInfo*>(allocator_data);
+    if ((memory_alloc_info == nullptr) || !memory_alloc_info->is_mapped)
+    {
+        return false;
+    }
+
+    *mapped_offset = memory_alloc_info->mapped_offset;
+    *only_buffers  = true;
+    for (const auto& entry : memory_alloc_info->original_objects)
+    {
+        if (entry.second->object_type != VK_OBJECT_TYPE_BUFFER)
+        {
+            *only_buffers = false;
+            break;
+        }
+    }
+    return true;
+}
+
 void VulkanRebindAllocator::ReportAllocateMemoryIncompatibility(const VkMemoryAllocateInfo* allocate_info)
 {
     // The rebind allocator defers allocation until bind and always returns success from vkAllocateMemory, so has no

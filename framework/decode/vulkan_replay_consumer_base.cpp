@@ -24,6 +24,8 @@
 */
 
 #include "decode/vulkan_replay_consumer_base.h"
+#include "decode/vulkan_lane_tracker.h"
+#include "decode/vulkan_rebind_allocator.h"
 #include "decode/custom_vulkan_struct_handle_mappers.h"
 #include "decode/descriptor_update_template_decoder.h"
 #include "decode/resource_util.h"
@@ -4148,6 +4150,11 @@ VkResult VulkanReplayConsumerBase::PostCreateDeviceUpdateState(VulkanPhysicalDev
 
     // Track state of physical device properties and features at device creation
     device_info->property_feature_info = create_state.property_feature_info;
+    if (device_info->property_feature_info.feature_bufferDeviceAddress)
+    {
+        bda_device_created_ = true;
+    }
+    lane_helpers_pending_ = true;
 
     // Keep track of what queue families this device is planning on using.  This information is
     // very important if we end up using the VulkanVirtualSwapchain path.
@@ -5313,6 +5320,11 @@ VkResult VulkanReplayConsumerBase::OverrideQueueSubmit(PFN_vkQueueSubmit        
     GFXRECON_ASSERT(allocator != nullptr);
     allocator->ClearStagingResources();
 
+    if (lane_tracker_ != nullptr)
+    {
+        lane_tracker_->OnSubmit(queue_info->handle, current_submits_span, fence);
+    }
+
     if (options_.idle_before_submit)
     {
         auto device_table = GetInjectedDeviceCalls(device_info->handle);
@@ -5589,6 +5601,11 @@ VkResult VulkanReplayConsumerBase::OverrideQueueSubmit2(PFN_vkQueueSubmit2      
     auto allocator = device_info->allocator.get();
     GFXRECON_ASSERT(allocator != nullptr);
     allocator->ClearStagingResources();
+
+    if (lane_tracker_ != nullptr)
+    {
+        lane_tracker_->OnSubmit(queue_info->handle, current_submits_span, fence);
+    }
 
     if (options_.idle_before_submit)
     {
@@ -12668,6 +12685,10 @@ VulkanReplayConsumerBase::OverrideWaitSemaphores(PFN_vkWaitSemaphores    func,
     // If expected result is anything else, use the passed in timeout value.
     if (original_result == VK_SUCCESS)
     {
+        if ((lane_tracker_ != nullptr) && lane_tracker_->DeferWait(device, *wait_info))
+        {
+            return VK_SUCCESS;
+        }
         timeout = std::numeric_limits<uint64_t>::max();
     }
     else if (original_result == VK_TIMEOUT)
@@ -13666,6 +13687,11 @@ void VulkanReplayConsumerBase::Process_vkUpdateDescriptorSetWithTemplate(const A
     VkDescriptorUpdateTemplate in_descriptorUpdateTemplate = VK_NULL_HANDLE;
     auto update_template_info = object_info_table_->GetVkDescriptorUpdateTemplateInfo(args.descriptorUpdateTemplate);
 
+    if (lane_tracker_ != nullptr)
+    {
+        lane_tracker_->OnUnknownSetWrite(args.descriptorSet);
+    }
+
     MapDescriptorUpdateTemplateHandles(update_template_info, &args.pData);
 
     if (update_template_info != nullptr)
@@ -13826,6 +13852,11 @@ void VulkanReplayConsumerBase::Process_vkUpdateDescriptorSetWithTemplateKHR(
         MapHandle<VulkanDescriptorSetInfo>(args.descriptorSet, &CommonObjectInfoTable::GetVkDescriptorSetInfo);
     VkDescriptorUpdateTemplate in_descriptorUpdateTemplate = VK_NULL_HANDLE;
     auto update_template_info = object_info_table_->GetVkDescriptorUpdateTemplateInfo(args.descriptorUpdateTemplate);
+
+    if (lane_tracker_ != nullptr)
+    {
+        lane_tracker_->OnUnknownSetWrite(args.descriptorSet);
+    }
 
     MapDescriptorUpdateTemplateHandles(update_template_info, &args.pData);
 
@@ -14011,6 +14042,22 @@ void VulkanReplayConsumerBase::OverrideUpdateDescriptorSets(
                                                      GetDeviceAddressTracker(device_info));
     }
 
+    if (lane_tracker_ != nullptr)
+    {
+        // The contents of the sets are not followed through this path, so what a command buffer reads through them is
+        // unknown.
+        const auto* writes = p_descriptor_writes->GetMetaStructPointer();
+        for (uint32_t i = 0; i < descriptor_write_count; ++i)
+        {
+            lane_tracker_->OnUnknownSetWrite(writes[i].dstSet);
+        }
+        const auto* copies = p_pescriptor_copies->GetMetaStructPointer();
+        for (uint32_t i = 0; i < descriptor_copy_count; ++i)
+        {
+            lane_tracker_->OnUnknownSetWrite(copies[i].dstSet);
+        }
+    }
+
     func(
         device_info->handle, descriptor_write_count, in_pDescriptorWrites, descriptor_copy_count, in_pDescriptorCopies);
 
@@ -14124,6 +14171,77 @@ class EncodedParameterReader
 };
 
 } // namespace
+
+void VulkanReplayConsumerBase::PrepareLaneHelpers()
+{
+    lane_helpers_pending_ = false;
+    object_info_table_->VisitVkDeviceInfo([this](const VulkanDeviceInfo* device_info) {
+        GetDeviceAddressTracker(device_info);
+        GetDeviceAddressReplacer(device_info);
+        if (dynamic_cast<VulkanRebindAllocator*>(device_info->allocator.get()) == nullptr)
+        {
+            lane_unsupported_allocator_ = true;
+        }
+    });
+}
+
+VulkanReplayConsumerBase::LaneBufferBase VulkanReplayConsumerBase::GetLaneBufferBase(format::HandleId buffer_id) const
+{
+    LaneBufferBase base;
+    const VulkanBufferInfo* buffer_info = object_info_table_->GetVkBufferInfo(buffer_id);
+    if (buffer_info == nullptr)
+    {
+        return base;
+    }
+
+    const VulkanDeviceInfo* device_info = object_info_table_->GetVkDeviceInfo(buffer_info->parent_id);
+    if (device_info == nullptr)
+    {
+        return base;
+    }
+
+    const auto* allocator = dynamic_cast<const VulkanRebindAllocator*>(device_info->allocator.get());
+    VkDeviceSize offset   = 0;
+    if ((allocator != nullptr) &&
+        allocator->GetBufferBinding(buffer_info->allocator_data, buffer_info->handle, &base.memory, &offset))
+    {
+        base.valid  = true;
+        base.offset = offset;
+        base.size   = buffer_info->size;
+    }
+    return base;
+}
+
+bool VulkanReplayConsumerBase::GetLaneMappedWriteTarget(format::HandleId memory_id,
+                                                        uint64_t*        mapped_offset,
+                                                        bool*            only_buffers) const
+{
+    const VulkanDeviceMemoryInfo* memory_info = object_info_table_->GetVkDeviceMemoryInfo(memory_id);
+    if (memory_info == nullptr)
+    {
+        return false;
+    }
+
+    const VulkanDeviceInfo* device_info = object_info_table_->GetVkDeviceInfo(memory_info->parent_id);
+    if (device_info == nullptr)
+    {
+        return false;
+    }
+
+    const auto* allocator = dynamic_cast<const VulkanRebindAllocator*>(device_info->allocator.get());
+    VkDeviceSize offset   = 0;
+    if ((allocator == nullptr) || !allocator->GetMappedWriteTarget(memory_info->allocator_data, &offset, only_buffers))
+    {
+        return false;
+    }
+    *mapped_offset = offset;
+    return true;
+}
+
+void VulkanReplayConsumerBase::WaitSemaphoresNow(VkDevice device, const VkSemaphoreWaitInfo& wait_info)
+{
+    GetDeviceTable(device)->WaitSemaphores(device, &wait_info, std::numeric_limits<uint64_t>::max());
+}
 
 bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCallInfo& call_info,
                                                                      const uint8_t*     parameter_buffer,
@@ -14313,6 +14431,7 @@ bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCa
                 {
                     return false;
                 }
+                scratch.view_ids.push_back(is_texel ? view_id : format::kNullHandleId);
                 scratch.views.push_back(
                     is_texel ? handle_mapping::MapHandle<VulkanBufferViewInfo>(
                                    view_id, *object_info_table_, &CommonObjectInfoTable::GetVkBufferViewInfo)
@@ -14346,8 +14465,69 @@ bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCa
             (offsets.views != SIZE_MAX) ? scratch.views.data() + offsets.views : nullptr;
     }
 
+    if (lane_tracker_ != nullptr)
+    {
+        for (const VulkanDescriptorSetInfo* set_info : scratch.sets)
+        {
+            lane_tracker_->BeforeSetWrite(set_info->capture_id);
+        }
+    }
+
     GetDeviceTable(device_info->handle)
         ->UpdateDescriptorSets(device_info->handle, write_count, scratch.writes.data(), 0, nullptr);
+
+    if (lane_tracker_ != nullptr)
+    {
+        for (size_t w = 0; w < scratch.writes.size(); ++w)
+        {
+            const VkWriteDescriptorSet&               write   = scratch.writes[w];
+            const EncodedDescriptorWrites::Offsets&   offsets = scratch.offsets[w];
+            const format::HandleId                    set_id  = scratch.sets[w]->capture_id;
+            for (uint32_t i = 0; i < write.descriptorCount; ++i)
+            {
+                const uint32_t element = write.dstArrayElement + i;
+                switch (write.descriptorType)
+                {
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                    {
+                        const VkDescriptorBufferInfo& info = scratch.buffers[offsets.buffers + i];
+                        const VulkanBufferInfo*       buffer_info = scratch.buffer_infos[offsets.buffer_infos + i];
+                        lane_tracker_->OnBufferDescriptor(
+                            set_id,
+                            write.dstBinding,
+                            element,
+                            (buffer_info != nullptr) ? buffer_info->capture_id : format::kNullHandleId,
+                            info.offset,
+                            info.range,
+                            (write.descriptorType == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) ||
+                                (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC));
+                        break;
+                    }
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                        lane_tracker_->OnTexelDescriptor(
+                            set_id, write.dstBinding, element, scratch.view_ids[offsets.views + i]);
+                        break;
+                    default:
+                        lane_tracker_->OnOtherDescriptor(set_id, write.dstBinding, element);
+                        break;
+                }
+            }
+
+            // A write of several descriptors can continue in the next binding, which the slots do not follow
+            if ((write.descriptorCount > 1) && (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) &&
+                (write.descriptorType != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) &&
+                (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) &&
+                (write.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) &&
+                (write.descriptorType != VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT))
+            {
+                lane_tracker_->OnUnknownSetWrite(set_id);
+            }
+        }
+    }
 
     // The buffer descriptors are only used when dumping or by the address replacer, which has nothing to replace on
     // devices without bufferDeviceAddress

@@ -175,6 +175,11 @@ class DispatchVisitor
         {
             if (DecoderSupportsDispatch(*decoder, *args))
             {
+                if constexpr (!std::is_same_v<Args, FunctionCallArgs> && !std::is_same_v<Args, FillMemoryArgs> &&
+                              !std::is_same_v<Args, FrameEndMarkerArgs>)
+                {
+                    decoder->PreDispatchBarrier();
+                }
                 [[maybe_unused]] DecoderAllocGuard<DispatchTraits<Args>::kHasAllocGuard> alloc_guard{};
                 SetDecoderApiCallId(*decoder, *args);
                 GFXRECON_ASSERT(block_index_ != ParsedBlock::kInvalidIndex);

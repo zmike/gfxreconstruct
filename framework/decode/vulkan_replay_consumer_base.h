@@ -77,6 +77,9 @@
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(decode)
 
+class VulkanLaneTracker;
+class VulkanRebindAllocator;
+
 class VulkanReplayConsumerBase : public VulkanConsumer
 {
   public:
@@ -105,6 +108,46 @@ class VulkanReplayConsumerBase : public VulkanConsumer
     VulkanDecoder* GetDecoder() { return decoder_; }
 
     virtual void WaitDevicesIdle() override;
+
+    // False once replay needs the commands recorded in stream order on the dispatch thread: for resource dumping, and
+    // when a device uses buffer device addresses that the address replacer remaps while commands are recorded.
+    format::HandleId GetCommandBufferPoolId(format::HandleId command_buffer_id) const
+    {
+        const VulkanCommandBufferInfo* info = object_info_table_->GetVkCommandBufferInfo(command_buffer_id);
+        return (info != nullptr) ? info->pool_id : format::kNullHandleId;
+    }
+
+    bool LaneDevicesPending() const { return lane_helpers_pending_; }
+
+    // Creates the per-device helpers that the getters otherwise create on first use, which two threads must not do
+    // at once.
+    void PrepareLaneHelpers();
+
+    bool RecordLaneAllowed() const
+    {
+        return !options_.dumping_resources && !options_.isolate_render_passes && !bda_device_created_ &&
+               !lane_unsupported_allocator_;
+    }
+
+    // What the GPU reads is tracked in captured memory space, which the rebind allocator provides.
+    struct LaneBufferBase
+    {
+        bool     valid{ false };
+        uint64_t memory{ 0 }; // Capture id of the memory the buffer is bound to
+        uint64_t offset{ 0 }; // Offset of the buffer in that memory
+        uint64_t size{ 0 };
+    };
+
+    LaneBufferBase GetLaneBufferBase(format::HandleId buffer_id) const;
+
+    // The offset that the writes to a memory are relative to, and whether only buffers are bound to it.
+    bool GetLaneMappedWriteTarget(format::HandleId memory_id, uint64_t* mapped_offset, bool* only_buffers) const;
+
+    const CommonObjectInfoTable& GetLaneObjectTable() const { return *object_info_table_; }
+
+    void SetLaneTracker(VulkanLaneTracker* tracker) { lane_tracker_ = tracker; }
+
+    void WaitSemaphoresNow(VkDevice device, const VkSemaphoreWaitInfo& wait_info);
 
     virtual void ProcessStateBeginMarker(uint64_t frame_number) override;
 
@@ -1941,6 +1984,10 @@ class VulkanReplayConsumerBase : public VulkanConsumer
                           HandlePointerDecoder<VkShaderEXT>*                   pShaders);
 
     const VulkanReplayOptions& options_;
+    bool                       bda_device_created_{ false };
+    bool                       lane_helpers_pending_{ false };
+    bool                       lane_unsupported_allocator_{ false };
+    VulkanLaneTracker*         lane_tracker_{ nullptr };
 
     std::unique_ptr<VulkanReplayDumpResources> resource_dumper_;
 
@@ -2385,6 +2432,7 @@ class VulkanReplayConsumerBase : public VulkanConsumer
         std::vector<VkDescriptorBufferInfo>   buffers;
         std::vector<const VulkanBufferInfo*>  buffer_infos;
         std::vector<VkBufferView>             views;
+        std::vector<format::HandleId>         view_ids;
 
         void Clear()
         {
@@ -2395,6 +2443,7 @@ class VulkanReplayConsumerBase : public VulkanConsumer
             buffers.clear();
             buffer_infos.clear();
             views.clear();
+            view_ids.clear();
         }
     };
 
