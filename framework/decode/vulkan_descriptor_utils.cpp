@@ -77,93 +77,71 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
             continue;
         }
 
-        uint32_t arr_idx = write->dstArrayElement;
-
-        for (uint32_t i = 0; i < write_meta.decoded_value->descriptorCount; ++i)
-        {
-            if (binding_it->second.count != 0 && arr_idx >= binding_it->second.count)
-            {
-                // Advance to next non zero count binding
-                do
+        ForEachWrittenDescriptor(
+            descriptor_bindings_info,
+            binding_it,
+            *write,
+            stage_flags,
+            [&](VulkanDescriptorSetBindingInfo& current_binding_info, uint32_t arr_idx, uint32_t i) {
+                switch (write->descriptorType)
                 {
-                    ++binding_it;
-                } while (binding_it != descriptor_bindings_info.end() && binding_it->second.count == 0);
-
-                if (binding_it == descriptor_bindings_info.end())
-                {
-                    break;
-                }
-                arr_idx = 0;
-            }
-
-            auto& current_binding_info = binding_it->second;
-
-            current_binding_info.desc_type = write->descriptorType;
-            if (stage_flags != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM)
-            {
-                current_binding_info.stage_flags = stage_flags;
-            }
-
-            switch (write->descriptorType)
-            {
-                case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
-                case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
-                case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
-                case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
-                {
-                    auto& desc_image_info           = current_binding_info.image_info[arr_idx];
-                    desc_image_info.image_layout    = write->pImageInfo[i].imageLayout;
-                    desc_image_info.image_view_info = object_info_table.GetVkImageViewInfo(
-                        write_meta.pImageInfo->GetMetaStructPointer()[i].imageView);
-                }
-                break;
-
-                case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-                case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-                {
-                    current_binding_info.texel_buffer_view_info[arr_idx] =
-                        object_info_table.GetVkBufferViewInfo(write_meta.pTexelBufferView.GetPointer()[i]);
-                }
-                break;
-
-                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-                case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
-                case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
-                {
-                    auto& desc_buffer_info = current_binding_info.buffer_info[arr_idx];
-                    desc_buffer_info.buffer_info =
-                        object_info_table.GetVkBufferInfo(write_meta.pBufferInfo->GetMetaStructPointer()[i].buffer);
-                    desc_buffer_info.offset = write->pBufferInfo[i].offset;
-                    desc_buffer_info.range  = write->pBufferInfo[i].range;
-                }
-                break;
-
-                case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
-                {
-                    const auto* as_descriptors_meta =
-                        GetPNextMetaStruct<Decoded_VkWriteDescriptorSetAccelerationStructureKHR>(write_meta.pNext);
-                    if (as_descriptors_meta != nullptr)
+                    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+                    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
                     {
-                        const auto* as_ids = as_descriptors_meta->pAccelerationStructures.GetPointer();
-                        for (uint32_t as = 0; as < as_descriptors_meta->decoded_value->accelerationStructureCount; ++as)
+                        auto& desc_image_info           = current_binding_info.image_info[arr_idx];
+                        desc_image_info.image_layout    = write->pImageInfo[i].imageLayout;
+                        desc_image_info.image_view_info = object_info_table.GetVkImageViewInfo(
+                            write_meta.pImageInfo->GetMetaStructPointer()[i].imageView);
+                    }
+                    break;
+
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                    {
+                        current_binding_info.texel_buffer_view_info[arr_idx] =
+                            object_info_table.GetVkBufferViewInfo(write_meta.pTexelBufferView.GetPointer()[i]);
+                    }
+                    break;
+
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+                    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+                    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                    {
+                        auto& desc_buffer_info = current_binding_info.buffer_info[arr_idx];
+                        desc_buffer_info.buffer_info =
+                            object_info_table.GetVkBufferInfo(write_meta.pBufferInfo->GetMetaStructPointer()[i].buffer);
+                        desc_buffer_info.offset = write->pBufferInfo[i].offset;
+                        desc_buffer_info.range  = write->pBufferInfo[i].range;
+                    }
+                    break;
+
+                    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
+                    {
+                        const auto* as_descriptors_meta =
+                            GetPNextMetaStruct<Decoded_VkWriteDescriptorSetAccelerationStructureKHR>(write_meta.pNext);
+                        if (as_descriptors_meta != nullptr)
                         {
-                            const auto* as_info = object_info_table.GetVkAccelerationStructureKHRInfo(as_ids[as]);
-                            if (as_info != nullptr)
+                            const auto* as_ids = as_descriptors_meta->pAccelerationStructures.GetPointer();
+                            for (uint32_t as = 0; as < as_descriptors_meta->decoded_value->accelerationStructureCount;
+                                 ++as)
                             {
-                                current_binding_info.acceleration_structs_khr_info[arr_idx] = as_info;
+                                const auto* as_info = object_info_table.GetVkAccelerationStructureKHRInfo(as_ids[as]);
+                                if (as_info != nullptr)
+                                {
+                                    current_binding_info.acceleration_structs_khr_info[arr_idx] = as_info;
+                                }
                             }
                         }
                     }
-                }
-                break;
-
-                default:
                     break;
-            }
 
-            ++arr_idx;
-        }
+                    default:
+                        break;
+                }
+            });
     }
 }
 
@@ -180,6 +158,26 @@ bool IsAddressReplacementDescriptorType(VkDescriptorType type)
         default:
             return false;
     }
+}
+
+void HandleBufferDescriptorWrite(VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo& descriptor_bindings,
+                                 const VkWriteDescriptorSet&                            write,
+                                 const VulkanBufferInfo* const*                         buffer_infos)
+{
+    auto binding_it = descriptor_bindings.try_emplace(write.dstBinding).first;
+
+    binding_it->second.desc_type = write.descriptorType;
+
+    ForEachWrittenDescriptor(descriptor_bindings,
+                             binding_it,
+                             write,
+                             VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM,
+                             [&](VulkanDescriptorSetBindingInfo& current_binding_info, uint32_t arr_idx, uint32_t i) {
+                                 auto& desc_buffer_info       = current_binding_info.buffer_info[arr_idx];
+                                 desc_buffer_info.buffer_info = buffer_infos[i];
+                                 desc_buffer_info.offset      = write.pBufferInfo[i].offset;
+                                 desc_buffer_info.range       = write.pBufferInfo[i].range;
+                             });
 }
 
 VkShaderStageFlags PipelineBindPointToShaderStageFlags(VkPipelineBindPoint bind_point)
