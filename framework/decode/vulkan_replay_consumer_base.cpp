@@ -14026,6 +14026,347 @@ void VulkanReplayConsumerBase::OverrideUpdateDescriptorSets(
     }
 }
 
+namespace
+{
+
+// Reads values of the capture file encoding, failing once the parameters run out.
+class EncodedParameterReader
+{
+  public:
+    EncodedParameterReader(const uint8_t* buffer, size_t size) : buffer_(buffer), size_(size) {}
+
+    size_t BytesRead() const { return position_; }
+
+    bool Handle(format::HandleId& value) { return Advance(ValueDecoder::DecodeHandleIdValue(Data(), Left(), &value)); }
+
+    bool UInt32(uint32_t& value) { return Advance(ValueDecoder::DecodeUInt32Value(Data(), Left(), &value)); }
+
+    bool DeviceSize(VkDeviceSize& value)
+    {
+        static_assert(std::is_same_v<format::DeviceSizeEncodeType, uint64_t>);
+        return Advance(ValueDecoder::DecodeUInt64Value(Data(), Left(), &value));
+    }
+
+    template <typename T>
+    bool Enum(T& value)
+    {
+        return Advance(ValueDecoder::DecodeEnumValue(Data(), Left(), &value));
+    }
+
+    // Reads the attributes of a pointer to an array of structs or handles. The elements are read by the caller.
+    // A pointer without encoded data, which the capture leaves out for the arrays that do not match the descriptor
+    // type, is reported as null.
+    bool ArrayPointer(bool& is_null, size_t& length)
+    {
+        uint32_t attrib = 0;
+        if (!UInt32(attrib))
+        {
+            return false;
+        }
+
+        is_null = (attrib & format::PointerAttributes::kIsNull) != 0;
+        length  = 0;
+        if (is_null)
+        {
+            return true;
+        }
+
+        constexpr uint32_t kUnsupported = format::PointerAttributes::kIsArray2D | format::PointerAttributes::kIsString |
+                                          format::PointerAttributes::kIsWString;
+        if (((attrib & kUnsupported) != 0) || ((attrib & format::PointerAttributes::kIsArray) == 0))
+        {
+            return false;
+        }
+
+        uint64_t address = 0;
+        size_t   count   = 0;
+        if (((attrib & format::PointerAttributes::kHasAddress) != 0) &&
+            !Advance(ValueDecoder::DecodeAddress(Data(), Left(), &address)))
+        {
+            return false;
+        }
+
+        if (!Advance(ValueDecoder::DecodeSizeTValue(Data(), Left(), &count)))
+        {
+            return false;
+        }
+
+        if ((attrib & format::PointerAttributes::kHasData) == 0)
+        {
+            is_null = true;
+            return true;
+        }
+
+        if (count > Left())
+        {
+            return false;
+        }
+
+        length = count;
+        return true;
+    }
+
+  private:
+    const uint8_t* Data() const { return buffer_ + position_; }
+
+    size_t Left() const { return size_ - position_; }
+
+    // The value decoders return the bytes they read, which is 0 when the parameters have run out
+    bool Advance(size_t bytes_read)
+    {
+        position_ += bytes_read;
+        return bytes_read != 0;
+    }
+
+    const uint8_t* buffer_;
+    size_t         size_;
+    size_t         position_{ 0 };
+};
+
+} // namespace
+
+bool VulkanReplayConsumerBase::ProcessEncoded_vkUpdateDescriptorSets(const ApiCallInfo& call_info,
+                                                                     const uint8_t*     parameter_buffer,
+                                                                     size_t             buffer_size,
+                                                                     size_t&            bytes_read)
+{
+    // Resource dumping tracks the state of every descriptor type
+    if (options_.dumping_resources)
+    {
+        return false;
+    }
+
+    EncodedParameterReader in(parameter_buffer, buffer_size);
+    format::HandleId       device_id   = format::kNullHandleId;
+    uint32_t               write_count = 0;
+    bool                   is_null     = true;
+    size_t                 length      = 0;
+
+    if (!in.Handle(device_id) || !in.UInt32(write_count) || !in.ArrayPointer(is_null, length) || is_null ||
+        (length != write_count))
+    {
+        return false;
+    }
+
+    const VulkanDeviceInfo* device_info = object_info_table_->GetVkDeviceInfo(device_id);
+    if (device_info == nullptr)
+    {
+        return false;
+    }
+
+    auto& scratch = encoded_descriptor_writes_;
+    scratch.Clear();
+
+    // Nothing is replayed before the whole call is read, so that a call that is not handled here is decoded intact.
+    for (uint32_t w = 0; w < write_count; ++w)
+    {
+        VkWriteDescriptorSet& write        = scratch.writes.emplace_back();
+        uint32_t              pnext_attrib = 0;
+        format::HandleId      set_id       = format::kNullHandleId;
+
+        if (!in.Enum(write.sType) || !in.UInt32(pnext_attrib) ||
+            ((pnext_attrib & format::PointerAttributes::kIsNull) == 0) || !in.Handle(set_id) ||
+            !in.UInt32(write.dstBinding) || !in.UInt32(write.dstArrayElement) || !in.UInt32(write.descriptorCount) ||
+            !in.Enum(write.descriptorType))
+        {
+            return false;
+        }
+
+        bool is_image    = false;
+        bool is_buffer   = false;
+        bool is_texel    = false;
+        bool has_sampler = false;
+        switch (write.descriptorType)
+        {
+            case VK_DESCRIPTOR_TYPE_SAMPLER:
+            case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+                has_sampler = true;
+                [[fallthrough]];
+            case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+            case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+            case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+                is_image = true;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+            case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+            case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+                is_buffer = true;
+                break;
+            case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+            case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+                is_texel = true;
+                break;
+            default:
+                return false;
+        }
+
+        VulkanDescriptorSetInfo* set_info = object_info_table_->GetVkDescriptorSetInfo(set_id);
+        if (set_info == nullptr)
+        {
+            return false;
+        }
+        write.dstSet = set_info->handle;
+
+        EncodedDescriptorWrites::Offsets offsets{
+            scratch.images.size(), scratch.buffers.size(), scratch.views.size(), scratch.buffer_infos.size()
+        };
+
+        // pImageInfo
+        if (!in.ArrayPointer(is_null, length))
+        {
+            return false;
+        }
+        if (is_null)
+        {
+            offsets.images = SIZE_MAX;
+        }
+        else
+        {
+            for (size_t i = 0; i < length; ++i)
+            {
+                format::HandleId      sampler_id = format::kNullHandleId;
+                format::HandleId      view_id    = format::kNullHandleId;
+                VkDescriptorImageInfo info{};
+                if (!in.Handle(sampler_id) || !in.Handle(view_id) || !in.Enum(info.imageLayout))
+                {
+                    return false;
+                }
+                if (is_image)
+                {
+                    // TODO: This should be ignored if the descriptor set layout was created with an immutable
+                    // sampler.
+                    if (has_sampler)
+                    {
+                        info.sampler = handle_mapping::MapHandle<VulkanSamplerInfo>(
+                            sampler_id, *object_info_table_, &CommonObjectInfoTable::GetVkSamplerInfo);
+                    }
+                    if (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER)
+                    {
+                        info.imageView = handle_mapping::MapHandle<VulkanImageViewInfo>(
+                            view_id, *object_info_table_, &CommonObjectInfoTable::GetVkImageViewInfo);
+                    }
+                }
+                scratch.images.push_back(info);
+            }
+        }
+        if (is_image && (is_null || length < write.descriptorCount))
+        {
+            return false;
+        }
+
+        // pBufferInfo
+        if (!in.ArrayPointer(is_null, length))
+        {
+            return false;
+        }
+        if (is_null)
+        {
+            offsets.buffers = SIZE_MAX;
+        }
+        else
+        {
+            for (size_t i = 0; i < length; ++i)
+            {
+                format::HandleId       buffer_id = format::kNullHandleId;
+                VkDescriptorBufferInfo info{};
+                if (!in.Handle(buffer_id) || !in.DeviceSize(info.offset) || !in.DeviceSize(info.range))
+                {
+                    return false;
+                }
+                if (is_buffer)
+                {
+                    const VulkanBufferInfo* buffer_info = object_info_table_->GetVkBufferInfo(buffer_id);
+                    if (buffer_info != nullptr)
+                    {
+                        info.buffer = buffer_info->handle;
+                    }
+                    else if (buffer_id != format::kNullHandleId)
+                    {
+                        GFXRECON_LOG_WARNING("Failed to map handle for object id %" PRIu64, buffer_id);
+                    }
+                    scratch.buffer_infos.push_back(buffer_info);
+                }
+                scratch.buffers.push_back(info);
+            }
+        }
+        if (is_buffer && (is_null || length < write.descriptorCount))
+        {
+            return false;
+        }
+
+        // pTexelBufferView
+        if (!in.ArrayPointer(is_null, length))
+        {
+            return false;
+        }
+        if (is_null)
+        {
+            offsets.views = SIZE_MAX;
+        }
+        else
+        {
+            for (size_t i = 0; i < length; ++i)
+            {
+                format::HandleId view_id = format::kNullHandleId;
+                if (!in.Handle(view_id))
+                {
+                    return false;
+                }
+                scratch.views.push_back(
+                    is_texel ? handle_mapping::MapHandle<VulkanBufferViewInfo>(
+                                   view_id, *object_info_table_, &CommonObjectInfoTable::GetVkBufferViewInfo)
+                             : VK_NULL_HANDLE);
+            }
+        }
+        if (is_texel && (is_null || length < write.descriptorCount))
+        {
+            return false;
+        }
+
+        scratch.offsets.push_back(offsets);
+        scratch.sets.push_back(set_info);
+    }
+
+    uint32_t copy_count = 0;
+    if (!in.UInt32(copy_count) || !in.ArrayPointer(is_null, length) || (copy_count != 0) || !is_null)
+    {
+        return false;
+    }
+
+    // The arrays are final, so the writes can point into them.
+    for (size_t w = 0; w < scratch.writes.size(); ++w)
+    {
+        const auto& offsets = scratch.offsets[w];
+
+        scratch.writes[w].pImageInfo = (offsets.images != SIZE_MAX) ? scratch.images.data() + offsets.images : nullptr;
+        scratch.writes[w].pBufferInfo =
+            (offsets.buffers != SIZE_MAX) ? scratch.buffers.data() + offsets.buffers : nullptr;
+        scratch.writes[w].pTexelBufferView =
+            (offsets.views != SIZE_MAX) ? scratch.views.data() + offsets.views : nullptr;
+    }
+
+    GetDeviceTable(device_info->handle)
+        ->UpdateDescriptorSets(device_info->handle, write_count, scratch.writes.data(), 0, nullptr);
+
+    // The information gathered here is only relevant when dumping or for portability-features
+    if (UseExtraDescriptorInfo(device_info))
+    {
+        for (size_t w = 0; w < scratch.writes.size(); ++w)
+        {
+            const VkWriteDescriptorSet& write = scratch.writes[w];
+            if (IsAddressReplacementDescriptorType(write.descriptorType))
+            {
+                HandleBufferDescriptorWrite(
+                    scratch.sets[w]->descriptors, write, scratch.buffer_infos.data() + scratch.offsets[w].buffer_infos);
+            }
+        }
+    }
+
+    bytes_read = in.BytesRead();
+    return true;
+}
+
 bool VulkanReplayConsumerBase::SkipPipelineCreationForCompileRequired(VkResult                          original_result,
                                                                       HandlePointerDecoder<VkPipeline>* pipelines)
 {

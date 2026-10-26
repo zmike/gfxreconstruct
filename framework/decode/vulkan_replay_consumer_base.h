@@ -93,6 +93,12 @@ class VulkanReplayConsumerBase : public VulkanConsumer
         gfxrecon::util::filepath::CheckReplayerName(info_record.AppName);
     }
 
+    // Replays plain vkUpdateDescriptorSets calls straight from the encoded parameters; other calls are decoded.
+    bool ProcessEncoded_vkUpdateDescriptorSets(const ApiCallInfo& call_info,
+                                               const uint8_t*     parameter_buffer,
+                                               size_t             buffer_size,
+                                               size_t&            bytes_read) override;
+
     void SetFpsInfo(graphics::FpsInfo* fps_info) { fps_info_ = fps_info; }
 
     void           SetDecoder(VulkanDecoder* decoder) { decoder_ = decoder; };
@@ -2361,6 +2367,39 @@ class VulkanReplayConsumerBase : public VulkanConsumer
                               PreDestroyHook                                             pre_destroy_hook = nullptr);
 
   private:
+    // Scratch space of ProcessEncoded_vkUpdateDescriptorSets, kept to reuse its allocations.
+    struct EncodedDescriptorWrites
+    {
+        struct Offsets
+        {
+            size_t images;
+            size_t buffers;
+            size_t views;
+            size_t buffer_infos;
+        };
+
+        std::vector<VkWriteDescriptorSet>     writes;
+        std::vector<Offsets>                  offsets;
+        std::vector<VulkanDescriptorSetInfo*> sets;
+        std::vector<VkDescriptorImageInfo>    images;
+        std::vector<VkDescriptorBufferInfo>   buffers;
+        std::vector<const VulkanBufferInfo*>  buffer_infos;
+        std::vector<VkBufferView>             views;
+
+        void Clear()
+        {
+            writes.clear();
+            offsets.clear();
+            sets.clear();
+            images.clear();
+            buffers.clear();
+            buffer_infos.clear();
+            views.clear();
+        }
+    };
+
+    EncodedDescriptorWrites encoded_descriptor_writes_;
+
     util::platform::LibraryHandle                                            loader_handle_;
     PFN_vkGetInstanceProcAddr                                                get_instance_proc_addr_;
     PFN_vkCreateInstance                                                     create_instance_proc_;

@@ -56,6 +56,16 @@ class VulkanConsumerBase : public CommonConsumerBase
 
     virtual void StartLooping() {}
 
+    // Lets a consumer replay a call straight from the encoded parameters. Returns false when it did not take the call,
+    // which is then decoded and passed to Process_vkUpdateDescriptorSets as usual.
+    virtual bool ProcessEncoded_vkUpdateDescriptorSets(const ApiCallInfo& call_info,
+                                                       const uint8_t*     parameter_buffer,
+                                                       size_t             buffer_size,
+                                                       size_t&            bytes_read)
+    {
+        return false;
+    }
+
     virtual void Process_vkUpdateDescriptorSetWithTemplate(const ApiCallInfo&                     call_info,
                                                            args::UpdateDescriptorSetWithTemplate& args)
     {}

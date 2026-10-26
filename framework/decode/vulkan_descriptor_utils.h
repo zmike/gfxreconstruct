@@ -42,6 +42,55 @@ void HandleDescriptorUpdate(CommonObjectInfoTable&                              
 // True for the descriptor types whose tracked state address replacement reads.
 bool IsAddressReplacementDescriptorType(VkDescriptorType type);
 
+// Calls fn(binding_info, array_index, element_index) for each of the write's descriptorCount elements, moving on to
+// the next binding when an element lies beyond the count of the current one. binding_it is the entry of the write's
+// dstBinding in bindings.
+template <typename Fn>
+void ForEachWrittenDescriptor(VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo&          bindings,
+                              VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo::iterator binding_it,
+                              const VkWriteDescriptorSet&                                     write,
+                              VkShaderStageFlags                                              stage_flags,
+                              Fn&&                                                            fn)
+{
+    uint32_t arr_idx = write.dstArrayElement;
+
+    for (uint32_t i = 0; i < write.descriptorCount; ++i)
+    {
+        if (binding_it->second.count != 0 && arr_idx >= binding_it->second.count)
+        {
+            // Advance to next non zero count binding
+            do
+            {
+                ++binding_it;
+            } while (binding_it != bindings.end() && binding_it->second.count == 0);
+
+            if (binding_it == bindings.end())
+            {
+                break;
+            }
+            arr_idx = 0;
+        }
+
+        auto& current_binding_info = binding_it->second;
+
+        current_binding_info.desc_type = write.descriptorType;
+        if (stage_flags != VK_SHADER_STAGE_FLAG_BITS_MAX_ENUM)
+        {
+            current_binding_info.stage_flags = stage_flags;
+        }
+
+        fn(current_binding_info, arr_idx, i);
+
+        ++arr_idx;
+    }
+}
+
+// Records the buffer descriptors of a write whose type is one of the buffer types, as HandleDescriptorUpdate does.
+// buffer_infos holds the tracked buffer of each of the write's descriptorCount elements.
+void HandleBufferDescriptorWrite(VulkanDescriptorSetInfo::VulkanDescriptorBindingsInfo& descriptor_bindings,
+                                 const VkWriteDescriptorSet&                            write,
+                                 const VulkanBufferInfo* const*                         buffer_infos);
+
 VkShaderStageFlags PipelineBindPointToShaderStageFlags(VkPipelineBindPoint bind_point);
 
 GFXRECON_END_NAMESPACE(decode)

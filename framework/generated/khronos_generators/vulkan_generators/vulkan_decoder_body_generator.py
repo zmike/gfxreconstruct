@@ -77,6 +77,9 @@ class VulkanDecoderBodyGenerator(VulkanBaseGenerator, KhronosDecoderBodyGenerato
     Generate a C++ class for Vulkan API parameter decoding.
     """
 
+    # Calls a consumer may take as the encoded parameters (VulkanConsumerBase::ProcessEncoded_<name>)
+    ENCODED_CONSUMER_CALLS = ['vkUpdateDescriptorSets']
+
     def __init__(
         self, err_file=sys.stderr, warn_file=sys.stderr, diag_file=sys.stdout
     ):
@@ -110,6 +113,17 @@ class VulkanDecoderBodyGenerator(VulkanBaseGenerator, KhronosDecoderBodyGenerato
         epilogue = ''
         arg_names = []
         has_base_header_to_peak = False
+
+        # A consumer can replay these calls straight from the encoded parameters, skipping the decoded args.
+        if name in self.ENCODED_CONSUMER_CALLS:
+            main_body += '    if (GetConsumers().size() == 1)\n'
+            main_body += '    {\n'
+            main_body += '        size_t encoded_bytes_read = 0;\n'
+            main_body += f'        if (GetConsumers()[0]->ProcessEncoded_{name}(call_info, parameter_buffer, buffer_size, encoded_bytes_read))\n'
+            main_body += '        {\n'
+            main_body += '            return encoded_bytes_read;\n'
+            main_body += '        }\n'
+            main_body += '    }\n\n'
 
         # Declare args.
         args_struct_name = VulkanBaseGenerator.make_args_struct_name(name, namespace='args::')

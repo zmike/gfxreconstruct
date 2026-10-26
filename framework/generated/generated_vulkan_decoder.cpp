@@ -1842,6 +1842,15 @@ size_t VulkanDecoder::Decode_vkUpdateDescriptorSets(const ApiCallInfo& call_info
 {
     size_t bytes_read = 0;
 
+    if (GetConsumers().size() == 1)
+    {
+        size_t encoded_bytes_read = 0;
+        if (GetConsumers()[0]->ProcessEncoded_vkUpdateDescriptorSets(call_info, parameter_buffer, buffer_size, encoded_bytes_read))
+        {
+            return encoded_bytes_read;
+        }
+    }
+
     args::UpdateDescriptorSets args;
 
     bytes_read += ValueDecoder::DecodeHandleIdValue((parameter_buffer + bytes_read), (buffer_size - bytes_read), &args.device);
