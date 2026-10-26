@@ -143,6 +143,12 @@ class VulkanReplayConsumerBase : public VulkanConsumer
     // The offset that the writes to a memory are relative to, and whether only buffers are bound to it.
     bool GetLaneMappedWriteTarget(format::HandleId memory_id, uint64_t* mapped_offset, bool* only_buffers) const;
 
+    // Dispatch thread: the shadow copy of a fill that the gpu lane replays without it. False if it was not made.
+    bool CopyLaneFillShadow(
+        format::HandleId memory_id, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data);
+
+    VulkanRebindAllocator* GetLaneRebindAllocator(const VulkanDeviceMemoryInfo* memory_info) const;
+
     const CommonObjectInfoTable& GetLaneObjectTable() const { return *object_info_table_; }
 
     void SetLaneTracker(VulkanLaneTracker* tracker) { lane_tracker_ = tracker; }

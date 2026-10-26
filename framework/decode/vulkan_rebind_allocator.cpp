@@ -2057,6 +2057,59 @@ VulkanRebindAllocator::AllocateZeroedBuffer(size_t size)
     return std::unique_ptr<uint8_t[], ZeroedBufferDeleter>(static_cast<uint8_t*>(calloc(size, 1)));
 }
 
+static thread_local bool shadow_copy_elsewhere = false;
+
+void VulkanRebindAllocator::SetShadowCopyElsewhere(bool elsewhere)
+{
+    shadow_copy_elsewhere = elsewhere;
+}
+
+VkResult VulkanRebindAllocator::EnsureShadowCopy(MemoryAllocInfo* memory_alloc_info)
+{
+    if (memory_alloc_info->original_content == nullptr)
+    {
+        GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, memory_alloc_info->allocation_size);
+        size_t allocation_size = static_cast<size_t>(memory_alloc_info->allocation_size);
+
+        memory_alloc_info->original_content = AllocateZeroedBuffer(allocation_size);
+        if (memory_alloc_info->original_content == nullptr)
+        {
+            GFXRECON_LOG_ERROR("Failed to allocate %zu bytes for the shadow copy of mapped memory", allocation_size);
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+    return VK_SUCCESS;
+}
+
+void VulkanRebindAllocator::CopyToShadow(MemoryAllocInfo* memory_alloc_info,
+                                         uint64_t         position,
+                                         uint64_t         size,
+                                         const uint8_t*   data)
+{
+    GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, size);
+    size_t   copy_size = static_cast<size_t>(size);
+    uint8_t* copy_dst  = memory_alloc_info->original_content.get() + position;
+
+    util::platform::MemoryCopy(copy_dst, copy_size, data, copy_size);
+}
+
+VkResult VulkanRebindAllocator::WriteShadowCopy(
+    MemoryData allocator_data, uint64_t mapped_offset, uint64_t offset, uint64_t size, const uint8_t* data)
+{
+    auto memory_alloc_info = reinterpret_cast<MemoryAllocInfo*>(allocator_data);
+    if (memory_alloc_info == nullptr)
+    {
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+
+    VkResult result = EnsureShadowCopy(memory_alloc_info);
+    if (result == VK_SUCCESS)
+    {
+        CopyToShadow(memory_alloc_info, mapped_offset + offset, size, data);
+    }
+    return result;
+}
+
 VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_data,
                                                        uint64_t       offset,
                                                        uint64_t       size,
@@ -2070,17 +2123,13 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
 
         if (memory_alloc_info->is_mapped)
         {
-            if (memory_alloc_info->original_content == nullptr)
+            const bool shadow_elsewhere = shadow_copy_elsewhere;
+            if (!shadow_elsewhere)
             {
-                GFXRECON_CHECK_CONVERSION_DATA_LOSS(size_t, memory_alloc_info->allocation_size);
-                size_t allocation_size = static_cast<size_t>(memory_alloc_info->allocation_size);
-
-                memory_alloc_info->original_content = AllocateZeroedBuffer(allocation_size);
-                if (memory_alloc_info->original_content == nullptr)
+                result = EnsureShadowCopy(memory_alloc_info);
+                if (result != VK_SUCCESS)
                 {
-                    GFXRECON_LOG_ERROR("Failed to allocate %zu bytes for the shadow copy of mapped memory",
-                                       allocation_size);
-                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                    return result;
                 }
             }
 
@@ -2102,6 +2151,13 @@ VkResult VulkanRebindAllocator::WriteMappedMemoryRange(MemoryData     allocator_
                 {
                     UpdateBoundResource(entry.second, entry_bound, write_start, write_end, data);
                 }
+            }
+
+            // Update the reconstructed memory, which is written to memory allocations created at resource bind to
+            // ensure they contain the correct data.
+            if (!shadow_elsewhere)
+            {
+                CopyToShadow(memory_alloc_info, memory_alloc_info->mapped_offset + offset, size, data);
             }
 
             result = VK_SUCCESS;
