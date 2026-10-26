@@ -39,6 +39,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -85,6 +86,7 @@ class VulkanLaneDecoder : public VulkanDecoder
     {
         PrepareHelpers();
         NoteMapping(call_id, parameter_buffer, buffer_size);
+        bool oversize_gpu = false;
         if (UseLanes())
         {
             switch (Classify(call_id))
@@ -100,8 +102,12 @@ class VulkanLaneDecoder : public VulkanDecoder
                         {
                             return;
                         }
+                        // A call too big for the ring is replayed here, with the lane idle and the observer in the path
+                        BeforeInline(false);
+                        observer_.NoteCall(call_id, parameter_buffer, buffer_size);
+                        record_.decoder.DecodeFunctionCall(call_id, call_info, parameter_buffer, buffer_size);
+                        return;
                     }
-                    break;
                 case CallClass::kGpu:
                     {
                         uint64_t dep = 0;
@@ -132,6 +138,8 @@ class VulkanLaneDecoder : public VulkanDecoder
                             flush_needed_ |= (call_id == format::ApiCall_vkWaitSemaphores) || (call_id == format::ApiCall_vkWaitSemaphoresKHR);
                             return;
                         }
+                        // A call too big for the ring is replayed here, and what it puts off is flushed later
+                        oversize_gpu = true;
                     }
                     break;
                 case CallClass::kOrdered:
@@ -140,16 +148,21 @@ class VulkanLaneDecoder : public VulkanDecoder
         }
 
         BeforeInline(NeedsGpuIdle(call_id));
+        if (!lanes_off_ && VulkanLaneGpuObserver::FollowsInline(call_id))
+        {
+            gpu_peek_.DecodeFunctionCall(call_id, call_info, parameter_buffer, buffer_size);
+        }
         VulkanDecoder::DecodeFunctionCall(call_id, call_info, parameter_buffer, buffer_size);
+        flush_needed_ |= oversize_gpu;
     }
 
     void DispatchFillMemoryCommand(
         format::ThreadId thread_id, uint64_t memory_id, uint64_t offset, uint64_t size, const uint8_t* data) override
     {
+        PrepareHelpers();
         // A fill that cannot fit the ring is replayed here, which makes its own shadow copy
         if (UseLanes() && (size + 4096 <= kRingSize / 4))
         {
-            PrepareHelpers();
             // The shadow copy is made here when the mapping is known, since the gpu lane changes it later
             const bool shadow_done = CopyFillShadow(memory_id, offset, size, data);
             uint64_t   header[4]   = { memory_id, offset, size, shadow_done ? 1u : 0u };
@@ -178,6 +191,12 @@ class VulkanLaneDecoder : public VulkanDecoder
     {
         BeforeInline();
         VulkanDecoder::WaitIdle();
+    }
+
+    void StartLooping() override
+    {
+        BeforeInline();
+        VulkanDecoder::StartLooping();
     }
 
   private:
@@ -616,11 +635,20 @@ class VulkanLaneDecoder : public VulkanDecoder
     {
         if (!lanes_off_ && !consumer_->RecordLaneAllowed())
         {
+            TurnLanesOff();
+        }
+        return !lanes_off_;
+    }
+
+    // The calls that follow are replayed here
+    void TurnLanesOff()
+    {
+        if (!lanes_off_)
+        {
             lanes_off_ = true;
             BeforeInline();
             consumer_->SetLaneTracker(nullptr);
         }
-        return !lanes_off_;
     }
 
     // Everything that the lanes put off is replayed, since a call that is not followed may depend on the GPU
@@ -684,9 +712,18 @@ class VulkanLaneDecoder : public VulkanDecoder
         {
             return false;
         }
+        // The fills of a memory are copied in order, so after one is left to the gpu lane the rest are too
+        if (shadow_on_gpu_lane_.contains(memory_id))
+        {
+            return false;
+        }
         auto it = mapped_offsets_.find(memory_id);
-        return (it != mapped_offsets_.end()) &&
-               consumer_->CopyLaneFillShadow(memory_id, it->second, offset, size, data);
+        if ((it != mapped_offsets_.end()) && consumer_->CopyLaneFillShadow(memory_id, it->second, offset, size, data))
+        {
+            return true;
+        }
+        shadow_on_gpu_lane_.insert(memory_id);
+        return false;
     }
 
     // Before a call is replayed on the dispatch thread, which has the object tables to itself
@@ -809,7 +846,10 @@ class VulkanLaneDecoder : public VulkanDecoder
         entry->dep            = dep;
         entry->pool           = pool;
         std::memcpy(dst + sizeof(Entry), &call_info, sizeof(ApiCallInfo));
-        std::memcpy(dst + sizeof(Entry) + sizeof(ApiCallInfo), parameters, size);
+        if (size != 0)
+        {
+            std::memcpy(dst + sizeof(Entry) + sizeof(ApiCallInfo), parameters, size);
+        }
         if (extra_size != 0)
         {
             std::memcpy(dst + sizeof(Entry) + sizeof(ApiCallInfo) + size, extra, extra_size);
@@ -1015,6 +1055,7 @@ class VulkanLaneDecoder : public VulkanDecoder
     VulkanLaneRecordObserver  observer_;
     VulkanLaneGpuObserver     gpu_observer_;
     std::unordered_map<format::HandleId, uint64_t> mapped_offsets_; ///< Mapped memory, at the offset it is mapped at
+    std::unordered_set<format::HandleId> shadow_on_gpu_lane_; ///< Memory whose fills the gpu lane copies to the shadow
     bool                                           mapping_followed_{ true };
     VulkanDecoder             gpu_peek_;
     bool                      lanes_off_{ false };

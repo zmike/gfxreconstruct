@@ -661,7 +661,8 @@ class VulkanRebindAllocator : public VulkanResourceAllocator
 
     bool StageableBuffer(const ResourceAllocInfo* resource_alloc_info,
                          const VmaMemoryInfo*     bound_memory_info,
-                         VkBuffer*                buffer) const;
+                         VkDeviceSize             dst_offset,
+                         VkBuffer*                buffer) const; // buffer may be null to only check
     bool StageBoundBuffer(ResourceAllocInfo* resource_alloc_info,
                           VmaMemoryInfo*     bound_memory_info,
                           VkDeviceSize       src_offset,
