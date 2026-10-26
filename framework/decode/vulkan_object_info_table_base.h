@@ -24,6 +24,7 @@
 #ifndef GFXRECON_DECODE_VULKAN_OBJECT_MAPPER_BASE_H
 #define GFXRECON_DECODE_VULKAN_OBJECT_MAPPER_BASE_H
 
+#include "decode/object_info_map.h"
 #include "decode/vulkan_object_info.h"
 #include "format/format.h"
 #include "util/defines.h"
@@ -99,12 +100,7 @@ struct ObjectInfoGetterBase
 
         if (id != 0)
         {
-            const auto entry = map->find(id);
-
-            if (entry != map->end())
-            {
-                object_info = &entry->second;
-            }
+            object_info = map->Lookup(id);
         }
 
         return object_info;
@@ -157,7 +153,7 @@ class VulkanObjectInfoTableBase
 {
   protected:
     template <typename T>
-    void AddVkObjectInfo(T&& info, std::unordered_map<format::HandleId, T>* map)
+    void AddVkObjectInfo(T&& info, ObjectInfoMap<format::HandleId, T>* map)
     {
         assert(map != nullptr);
 
@@ -206,7 +202,7 @@ class VulkanObjectInfoTableBase
     // Note: the "dummy" template parameter is here for the sole purpose of working around a gcc issue which does
     // not allow full specialization in non-namespace scope (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=85282)
     template <typename dummy>
-    void AddVkObjectInfo(VulkanSurfaceKHRInfo&& info, std::unordered_map<format::HandleId, VulkanSurfaceKHRInfo>* map)
+    void AddVkObjectInfo(VulkanSurfaceKHRInfo&& info, ObjectInfoMap<format::HandleId, VulkanSurfaceKHRInfo>* map)
     {
         assert(map != nullptr);
 
@@ -234,13 +230,13 @@ class VulkanObjectInfoTableBase
     }
 
     template <typename T>
-    const T* GetVkObjectInfo(format::HandleId id, const std::unordered_map<format::HandleId, T>* map) const
+    const T* GetVkObjectInfo(format::HandleId id, const ObjectInfoMap<format::HandleId, T>* map) const
     {
         return ObjectInfoGetter<T>()(id, map);
     }
 
     template <typename T>
-    T* GetVkObjectInfo(format::HandleId id, std::unordered_map<format::HandleId, T>* map)
+    T* GetVkObjectInfo(format::HandleId id, ObjectInfoMap<format::HandleId, T>* map)
     {
         return ObjectInfoGetter<T>()(id, map);
     }
