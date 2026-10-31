@@ -141,6 +141,12 @@ void FpsInfo::EndFrame(uint64_t frame)
     SetFirstSubmitDone(false);
 }
 
+bool FpsInfo::EndsMeasurement(uint64_t frame) const
+{
+    // Same condition as in EndFrame()
+    return started_measurement_ && !ended_measurement_ && (frame >= measurement_end_frame_ - 1);
+}
+
 bool FpsInfo::ShouldWaitIdleAfterFrame(uint64_t frame)
 {
     bool range_ended  = frame == measurement_end_frame_;

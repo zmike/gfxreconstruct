@@ -271,6 +271,11 @@ void Application::Run()
 
             if (fps_info_ != nullptr)
             {
+                if (fps_info_->EndsMeasurement(frame_number))
+                {
+                    // Replay may still owe the GPU the work of the frames before, which the range includes
+                    file_processor_->WaitDecodersIdle();
+                }
                 fps_info_->EndFrame(frame_number);
 
                 if (fps_info_->ShouldWaitIdleAfterFrame(frame_number))

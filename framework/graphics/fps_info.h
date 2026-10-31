@@ -54,6 +54,7 @@ class FpsInfo
     void                   BeginFile();
     bool                   ShouldWaitIdleBeforeFrame(uint64_t file_processor_frame);
     bool                   ShouldWaitIdleAfterFrame(uint64_t file_processor_frame);
+    bool                   EndsMeasurement(uint64_t file_processor_frame) const;
     bool                   ShouldQuit(uint64_t file_processor_frame);
     uint64_t               GetQuitBeforeFrame();
     void                   BeginFrame(uint64_t file_processor_frame);
