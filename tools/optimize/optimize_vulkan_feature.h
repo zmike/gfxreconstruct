@@ -58,11 +58,13 @@ class OptimizeVulkanFeature : public OptimizeFeature
 
   private:
     // Pass 1: collect handles that were never referenced in a command buffer submission, and let each
-    // modifier collect the state it needs.  Modifiers that found no work are dropped.
+    // modifier collect the state it needs.  Modifiers that found no work are dropped.  dropped_objects is
+    // set when a modifier will drop pipelines or descriptor sets, which can unreference more of the file.
     static bool ScanInput(const std::string&                    input_filename,
                           const util::ArgumentParser&           args,
                           std::unordered_set<format::HandleId>& unreferenced_ids,
-                          VulkanFileOptimizer::Modifiers&       modifiers);
+                          VulkanFileOptimizer::Modifiers&       modifiers,
+                          bool&                                 dropped_objects);
 
     // Passes 2-3: determine unreferenced block indices, then write the optimized output file.
     bool WriteOptimizedFile(const std::string&                          input_filename,

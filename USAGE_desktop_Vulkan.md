@@ -1249,13 +1249,24 @@ The pass runs by default. Pass `--no-aliasing-metadata` to leave the block out.
 A block already in the input is always removed, so re-optimizing a file never
 keeps more than one per device.
 
+The tool also drops objects that no recorded command buffer uses. Graphics and
+compute pipelines that nothing binds are not created, with the shader modules
+only those pipelines use. Descriptor sets that nothing binds are not allocated
+or updated. Both run by default. Pass `--keep-unused-pipelines` or
+`--keep-unused-descriptor-sets` to keep them. Dropping descriptor sets
+unreferences the resources only those sets named, so the tool repeats the scan
+on its own intermediate output until a pass drops nothing more.
+
 ```text
-gfxrecon-optimize - Remove unused resource initialization data from trimmed
-                    GFXReconstruct capture files, and record the memory
-                    aliasing groups found in them.
+gfxrecon-optimize - Remove unused resource initialization data, pipelines, and
+                    descriptor sets from trimmed GFXReconstruct capture
+                    files, and record the memory aliasing groups found in
+                    them.
 
 Usage:
-  gfxrecon-optimize [-h | --help] [--version] [--no-aliasing-metadata] <input-file> <output-file>
+  gfxrecon-optimize [-h | --help] [--version] [--no-aliasing-metadata]
+                    [--keep-unused-pipelines] [--keep-unused-descriptor-sets]
+                    <input-file> <output-file>
 
 Required arguments:
   <input-file>          The trimmed GFXReconstruct capture file to be
@@ -1272,6 +1283,13 @@ Optional arguments:
                         one the input already has. Replay then places aliased
                         resources one bind at a time, as it does for a capture
                         this tool has not seen.
+  --keep-unused-pipelines
+                        Create graphics and compute pipelines that no command
+                        buffer binds, and the shader modules only those
+                        pipelines use. By default they are not created.
+  --keep-unused-descriptor-sets
+                        Allocate and update descriptor sets that no command
+                        buffer binds. By default they are not.
 ```
 
 ### JSON Lines Conversion

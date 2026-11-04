@@ -36,6 +36,10 @@ class VulkanModifierBase : public decode::VulkanConsumer, public CallModifierBas
 {
   public:
     ~VulkanModifierBase() override = default;
+
+    // True if CanOptimize() can drop objects whose other users may then become unreferenced, so the
+    // optimizer should scan the result again.
+    virtual bool DropsObjects() const { return false; }
 };
 
 GFXRECON_END_NAMESPACE(gfxrecon)

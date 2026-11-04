@@ -25,6 +25,8 @@
 #if defined(GFXRECON_ENABLE_VULKAN)
 // The modifier writes its block through gfxrecon_encode, we need to apply the same guard here
 #include "vulkan_aliasing_group_modifier.h"
+#include "vulkan_unused_descriptor_set_modifier.h"
+#include "vulkan_unused_pipeline_modifier.h"
 #endif
 #include "vulkan_file_optimizer.h"
 #include "decode/file_processor.h"
@@ -35,6 +37,7 @@
 #include "util/logging.h"
 
 #include <cinttypes>
+#include <filesystem>
 #include <memory>
 
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
@@ -46,6 +49,10 @@ GFXR_UTIL_REGISTER_FEATURE_CREATOR(OptimizeFeature, OptimizeVulkanFeature)
 // every existing caller of this tool gets that change by default and needs a way back.
 constexpr char kNoAliasingMetadata[] = "--no-aliasing-metadata";
 
+// Dropping pipelines and descriptor sets changes which objects a replay creates, so each has a way back.
+constexpr char kKeepUnusedPipelines[]      = "--keep-unused-pipelines";
+constexpr char kKeepUnusedDescriptorSets[] = "--keep-unused-descriptor-sets";
+
 std::vector<util::FeatureOptionDesc> OptimizeVulkanFeature::GetOptionDescs() const
 {
     return { { .name          = "",
@@ -54,7 +61,19 @@ std::vector<util::FeatureOptionDesc> OptimizeVulkanFeature::GetOptionDescs() con
                                   "then places aliased resources one bind at a time, as it does for a",
                                   "capture this tool has not seen." },
                .has_argument  = false,
-               .trigger_names = kNoAliasingMetadata } };
+               .trigger_names = kNoAliasingMetadata },
+             { .name          = "",
+               .description   = { "Create graphics and compute pipelines that no command buffer binds, and the",
+                                  "shader modules only those pipelines use. By default they are not created,",
+                                  "which for a trimmed capture removes most of the driver compiles at replay." },
+               .has_argument  = false,
+               .trigger_names = kKeepUnusedPipelines },
+             { .name          = "",
+               .description   = { "Allocate and update descriptor sets that no command buffer binds. By default",
+                                  "they are not, which for a trimmed capture removes most of the descriptor",
+                                  "updates at replay." },
+               .has_argument  = false,
+               .trigger_names = kKeepUnusedDescriptorSets } };
 }
 
 std::string OptimizeVulkanFeature::CompiledHeaderVersionString() const
@@ -89,14 +108,25 @@ bool OptimizeVulkanFeature::ShouldRun(const util::ArgumentParser& args) const
 bool OptimizeVulkanFeature::ScanInput(const std::string&                    input_filename,
                                       const util::ArgumentParser&           args,
                                       std::unordered_set<format::HandleId>& unreferenced_ids,
-                                      VulkanFileOptimizer::Modifiers&       modifiers)
+                                      VulkanFileOptimizer::Modifiers&       modifiers,
+                                      bool&                                 dropped_objects)
 {
+    dropped_objects = false;
+
     // Modifiers are constructed here, then dropped again if the scan finds nothing for them to do.
     VulkanFileOptimizer::Modifiers candidates;
 
 #if defined(GFXRECON_ENABLE_VULKAN)
     // Runs even with the opt-out, to strip a block an earlier run wrote.
     candidates.push_back(std::make_unique<VulkanAliasingGroupModifier>(!args.IsOptionSet(kNoAliasingMetadata)));
+    if (!args.IsOptionSet(kKeepUnusedPipelines))
+    {
+        candidates.push_back(std::make_unique<VulkanUnusedPipelineModifier>());
+    }
+    if (!args.IsOptionSet(kKeepUnusedDescriptorSets))
+    {
+        candidates.push_back(std::make_unique<VulkanUnusedDescriptorSetModifier>());
+    }
 #endif
 
     decode::FileProcessor file_processor;
@@ -134,6 +164,7 @@ bool OptimizeVulkanFeature::ScanInput(const std::string&                    inpu
     {
         if (candidate->CanOptimize())
         {
+            dropped_objects = dropped_objects || candidate->DropsObjects();
             modifiers.push_back(std::move(candidate));
         }
     }
@@ -199,28 +230,86 @@ bool OptimizeVulkanFeature::Optimize(const std::string&          input_filename,
                                      const std::string&          output_filename,
                                      const util::ArgumentParser& args)
 {
-    GFXRECON_WRITE_CONSOLE("Scanning Vulkan file %s for optimizations.", input_filename.c_str());
+    // Dropping a descriptor set unreferences the resources only it named, so one pass can make the next
+    // one find more. Each pass reads the previous pass's output, until a pass drops no pipelines or
+    // descriptor sets. That last pass also removes the initialization data the earlier drops freed.
+    constexpr uint32_t kMaxPasses = 16;
 
-    std::unordered_set<format::HandleId> unreferenced_ids;
-    VulkanFileOptimizer::Modifiers       modifiers;
-    if (!ScanInput(input_filename, args, unreferenced_ids, modifiers))
+    std::string current = input_filename;
+
+    for (uint32_t pass = 1; pass <= kMaxPasses; ++pass)
     {
+        GFXRECON_WRITE_CONSOLE("Scanning Vulkan file %s for optimizations (pass %u).", current.c_str(), pass);
+
+        std::unordered_set<format::HandleId> unreferenced_ids;
+        VulkanFileOptimizer::Modifiers       modifiers;
+        bool                                 dropped_objects = false;
+        if (!ScanInput(current, args, unreferenced_ids, modifiers, dropped_objects))
+        {
+            if (current != input_filename)
+            {
+                std::error_code ec;
+                std::filesystem::remove(current, ec);
+            }
+            return false;
+        }
+
+        if (unreferenced_ids.empty() && modifiers.empty())
+        {
+            if (pass == 1)
+            {
+                GFXRECON_WRITE_CONSOLE("Nothing to optimize. A new file will not be created.");
+                return true;
+            }
+            break;
+        }
+
+        if (!unreferenced_ids.empty())
+        {
+            GFXRECON_WRITE_CONSOLE(
+                "Writing optimized file, removing initialization data for %" PRIu64 " unused resources.",
+                unreferenced_ids.size());
+        }
+
+        const bool        last   = !dropped_objects || (pass == kMaxPasses);
+        const std::string target = last ? output_filename : output_filename + ".pass" + std::to_string(pass);
+        const bool        ok     = WriteOptimizedFile(current, target, unreferenced_ids, std::move(modifiers));
+
+        std::error_code ec;
+        if (current != input_filename)
+        {
+            std::filesystem::remove(current, ec);
+        }
+        if (!ok)
+        {
+            std::filesystem::remove(target, ec);
+            return false;
+        }
+
+        current = target;
+        if (last)
+        {
+            if (dropped_objects)
+            {
+                GFXRECON_WRITE_CONSOLE("Stopped after %u passes; the output may still contain unused objects.",
+                                       kMaxPasses);
+            }
+            return true;
+        }
+    }
+
+    // A later pass found nothing to do, so the previous pass's output is the result.
+    std::error_code ec;
+    std::filesystem::rename(current, output_filename, ec);
+    if (ec)
+    {
+        GFXRECON_WRITE_CONSOLE("Failed to rename %s to %s: %s",
+                               current.c_str(),
+                               output_filename.c_str(),
+                               ec.message().c_str());
         return false;
     }
-
-    if (unreferenced_ids.empty() && modifiers.empty())
-    {
-        GFXRECON_WRITE_CONSOLE("Nothing to optimize. A new file will not be created.");
-        return true;
-    }
-
-    if (!unreferenced_ids.empty())
-    {
-        GFXRECON_WRITE_CONSOLE("Writing optimized file, removing initialization data for %" PRIu64 " unused resources.",
-                               unreferenced_ids.size());
-    }
-
-    return WriteOptimizedFile(input_filename, output_filename, unreferenced_ids, std::move(modifiers));
+    return true;
 }
 
 GFXRECON_END_NAMESPACE(optimize)
