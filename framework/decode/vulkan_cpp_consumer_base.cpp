@@ -20,6 +20,7 @@
 #include "decode/vulkan_cpp_template_strings.h"
 
 #include PROJECT_VERSION_HEADER_FILE
+#include "graphics/vulkan_util.h"
 #include "util/file_path.h"
 #include "util/platform.h"
 #include <util/hash.h>
@@ -381,6 +382,7 @@ bool VulkanCppConsumerBase::WriteSwapchainFiles()
             fputs(sSwapchainSourceCode_part_1, source_file);
             fputs(sSwapchainSourceCode_part_2, source_file);
             fputs(sSwapchainSourceCode_part_3, source_file);
+            fputs(sInitDataSourceCode, source_file);
 
             util::platform::FileClose(source_file);
         }
@@ -502,6 +504,7 @@ void VulkanCppConsumerBase::EndFrameFile(uint32_t frameNumber, uint32_t frameSpl
     assert(main_file_ != nullptr);
 
     // Write out closing data for previous frame file.
+    fprintf(frame_file_, "\tToCppInitFlush();\n");
     fprintf(frame_file_, "%s", sCommonFrameSourceFooter);
     util::platform::FileClose(frame_file_);
     frame_file_ = nullptr;
@@ -2057,11 +2060,20 @@ void VulkanCppConsumerBase::Generate_vkCreateDescriptorUpdateTemplate(args::Crea
 
 struct VariableOffset
 {
-    std::string      name;
-    VkDescriptorType type;
+    std::vector<std::string> names;
+    VkDescriptorType         type;
     uint32_t         count;
     uint64_t         offset;
 };
+
+// Remove and return the next count variable names (one per descriptor in a template entry).
+static std::vector<std::string> TakeVariableNames(std::vector<std::string>& variables, uint32_t count)
+{
+    count = std::min<uint32_t>(count, static_cast<uint32_t>(variables.size()));
+    std::vector<std::string> names(variables.begin(), variables.begin() + count);
+    variables.erase(variables.begin(), variables.begin() + count);
+    return names;
+}
 
 bool VariableOffsetCompare(VariableOffset& a, VariableOffset& b)
 {
@@ -2188,9 +2200,10 @@ void VulkanCppConsumerBase::GenerateDescriptorUpdateTemplateData(DescriptorUpdat
             case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
             {
                 VariableOffset offset = {
-                    image_desc_info_variables[0], entry.descriptorType, entry.descriptorCount, entry.offset
+
+                    TakeVariableNames(image_desc_info_variables, entry.descriptorCount), entry.descriptorType, entry.descriptorCount, entry.offset
+
                 };
-                image_desc_info_variables.erase(image_desc_info_variables.begin());
                 variables.push_back(std::move(offset));
                 break;
             }
@@ -2200,9 +2213,10 @@ void VulkanCppConsumerBase::GenerateDescriptorUpdateTemplateData(DescriptorUpdat
             case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
             {
                 VariableOffset offset = {
-                    buffer_desc_info_variables[0], entry.descriptorType, entry.descriptorCount, entry.offset
+
+                    TakeVariableNames(buffer_desc_info_variables, entry.descriptorCount), entry.descriptorType, entry.descriptorCount, entry.offset
+
                 };
-                buffer_desc_info_variables.erase(buffer_desc_info_variables.begin());
                 variables.push_back(std::move(offset));
                 break;
             }
@@ -2210,18 +2224,20 @@ void VulkanCppConsumerBase::GenerateDescriptorUpdateTemplateData(DescriptorUpdat
             case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
             {
                 VariableOffset offset = {
-                    texel_desc_info_variables[0], entry.descriptorType, entry.descriptorCount, entry.offset
+
+                    TakeVariableNames(texel_desc_info_variables, entry.descriptorCount), entry.descriptorType, entry.descriptorCount, entry.offset
+
                 };
-                texel_desc_info_variables.erase(texel_desc_info_variables.begin());
                 variables.push_back(std::move(offset));
                 break;
             }
             case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
             {
                 VariableOffset offset = {
-                    accel_desc_info_variables[0], entry.descriptorType, entry.descriptorCount, entry.offset
+
+                    TakeVariableNames(accel_desc_info_variables, entry.descriptorCount), entry.descriptorType, entry.descriptorCount, entry.offset
+
                 };
-                accel_desc_info_variables.erase(accel_desc_info_variables.begin());
                 variables.push_back(std::move(offset));
                 break;
             }
@@ -2231,7 +2247,7 @@ void VulkanCppConsumerBase::GenerateDescriptorUpdateTemplateData(DescriptorUpdat
                 assert(false);
 
                 VariableOffset offset = {
-                    inline_uniform_block_info_variables[0], entry.descriptorType, entry.descriptorCount, entry.offset
+                    { inline_uniform_block_info_variables[0] }, entry.descriptorType, entry.descriptorCount, entry.offset
                 };
                 inline_uniform_block_info_variables.erase(inline_uniform_block_info_variables.begin());
                 variables.push_back(std::move(offset));
@@ -2294,7 +2310,11 @@ void VulkanCppConsumerBase::GenerateDescriptorUpdateTemplateData(DescriptorUpdat
                         break;
                 }
             }
-            struct_implement_stream << var.name << ", ";
+            // The decoder can have fewer entries than the template declares; zero-initialize the rest.
+            struct_implement_stream << (jdx < var.names.size() ? var.names[jdx] :
+                                        var.names.empty()      ? std::string("{}") :
+                                                                 var.names.back())
+                                    << ", ";
         }
         struct_implement_stream << "},\n";
     }
@@ -2958,6 +2978,137 @@ void VulkanCppConsumerBase::ProcessSetDeviceMemoryPropertiesCommand(
     original_memory_heaps_.push_back(memory_heaps);
 }
 
+void VulkanCppConsumerBase::Intercept_vkCreateBuffer(args::CreateBuffer& args)
+{
+    // The snapshot upload of a buffer's contents is a transfer into the buffer, as replay does for a trimmed capture.
+    VkBufferCreateInfo* create_info = args.pCreateInfo.GetPointer();
+    create_info->usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+}
+
+void VulkanCppConsumerBase::Intercept_vkCreateImage(args::CreateImage& args)
+{
+    VkImageCreateInfo* create_info = args.pCreateInfo.GetPointer();
+
+    // Transfers are not allowed on transient attachments, which have no contents to upload.
+    if ((create_info->usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) == 0)
+    {
+        create_info->usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
+
+    VulkanCppImageInitInfo& info = image_init_info_map_[*args.pImage.GetPointer()];
+    info.format                  = create_info->format;
+    info.extent                  = create_info->extent;
+    info.level_count             = create_info->mipLevels;
+    info.layer_count             = create_info->arrayLayers;
+    info.initial_layout          = create_info->initialLayout;
+    info.sample_count            = create_info->samples;
+}
+
+void VulkanCppConsumerBase::ProcessInitBufferCommand(format::HandleId device_id,
+                                                     format::HandleId buffer_id,
+                                                     uint64_t         data_size,
+                                                     const uint8_t*   data)
+{
+    const std::string device_name = GetHandle(device_id);
+    const std::string buffer_name = GetHandle(buffer_id);
+    if ((data_size == 0) || (device_name == "VK_NULL_HANDLE") || (buffer_name == "VK_NULL_HANDLE"))
+    {
+        return;
+    }
+
+    const SavedFileInfo file_info = data_packer_.AddFileContents(data, data_size);
+    FILE*               file      = GetFrameFile();
+    fprintf(file, "\t{\n");
+    fprintf(file, "\t\tvoid* staging = ToCppInitStaging(%s, %" PRIu64 ");\n", device_name.c_str(), data_size);
+    fprintf(file,
+            "\t\tLoadBinaryData(\"%s\", %" PRIu64 ", staging, 0, %" PRIu64 ", appdata);\n",
+            file_info.file_path.c_str(),
+            file_info.byte_offset,
+            data_size);
+    fprintf(file, "\t\tToCppInitBuffer(%s, %s, %" PRIu64 ");\n", device_name.c_str(), buffer_name.c_str(), data_size);
+    fprintf(file, "\t}\n");
+}
+
+void VulkanCppConsumerBase::ProcessInitImageCommand(format::HandleId             device_id,
+                                                    format::HandleId             image_id,
+                                                    uint64_t                     data_size,
+                                                    uint32_t                     aspect,
+                                                    uint32_t                     layout,
+                                                    const std::vector<uint64_t>& level_sizes,
+                                                    const uint8_t*               data)
+{
+    const std::string device_name = GetHandle(device_id);
+    const std::string image_name  = GetHandle(image_id);
+    auto              entry       = image_init_info_map_.find(image_id);
+    if ((device_name == "VK_NULL_HANDLE") || (image_name == "VK_NULL_HANDLE") || (entry == image_init_info_map_.end()))
+    {
+        return;
+    }
+
+    const VulkanCppImageInitInfo& info = entry->second;
+
+    // Offsets of the levels in the payload, as replay computes them: aligned for the format, or tightly packed for
+    // captures that did not align.
+    std::vector<uint64_t> offsets;
+    if ((data_size > 0) && (info.sample_count == VK_SAMPLE_COUNT_1_BIT) && (level_sizes.size() >= info.level_count))
+    {
+        const VkDeviceSize alignment = graphics::GetBufferImageCopyOffsetAlignment(info.format, aspect);
+        VkDeviceSize       current   = 0;
+        VkDeviceSize       required  = 0;
+        for (uint32_t i = 0; i < info.level_count; ++i)
+        {
+            current = graphics::AlignBufferOffset(current, alignment);
+            offsets.push_back(current);
+            required = std::max<VkDeviceSize>(required, current + level_sizes[i]);
+            current += level_sizes[i];
+        }
+
+        if ((alignment > 1) && (info.level_count > 1) && (required > data_size))
+        {
+            current = 0;
+            for (uint32_t i = 0; i < info.level_count; ++i)
+            {
+                offsets[i] = current;
+                current += level_sizes[i];
+            }
+        }
+    }
+
+    FILE* file = GetFrameFile();
+    fprintf(file, "\t{\n");
+    if (!offsets.empty())
+    {
+        const SavedFileInfo file_info = data_packer_.AddFileContents(data, data_size);
+        fprintf(file, "\t\tvoid* staging = ToCppInitStaging(%s, %" PRIu64 ");\n", device_name.c_str(), data_size);
+        fprintf(file,
+                "\t\tLoadBinaryData(\"%s\", %" PRIu64 ", staging, 0, %" PRIu64 ", appdata);\n",
+                file_info.file_path.c_str(),
+                file_info.byte_offset,
+                data_size);
+        fprintf(file, "\t\tconst uint64_t offsets[] = {");
+        for (uint64_t offset : offsets)
+        {
+            fprintf(file, "%" PRIu64 ", ", offset);
+        }
+        fprintf(file, "};\n");
+    }
+    fprintf(file,
+            "\t\tToCppInitImage(%s, %s, %s, %u, %s, %s, %u, %u, %u, %u, %u, %s);\n",
+            device_name.c_str(),
+            image_name.c_str(),
+            util::ToString<VkFormat>(info.format).c_str(),
+            aspect,
+            util::ToString<VkImageLayout>(info.initial_layout).c_str(),
+            util::ToString<VkImageLayout>(static_cast<VkImageLayout>(layout)).c_str(),
+            info.extent.width,
+            info.extent.height,
+            info.extent.depth,
+            info.level_count,
+            info.layer_count,
+            offsets.empty() ? "nullptr" : "offsets");
+    fprintf(file, "\t}\n");
+}
+
 void VulkanCppConsumerBase::ProcessFillMemoryCommand(uint64_t       memory_id,
                                                      uint64_t       offset,
                                                      uint64_t       size,
@@ -2968,6 +3119,8 @@ void VulkanCppConsumerBase::ProcessFillMemoryCommand(uint64_t       memory_id,
     auto entry = memory_id_map_.find(memory_id);
     if (entry != memory_id_map_.end())
     {
+        // Queued snapshot uploads must not land after this write.
+        fprintf(GetFrameFile(), "\tToCppInitFlush();\n");
         GenerateLoadData(file_info.file_path, file_info.byte_offset, memory_id_map_[memory_id].c_str(), offset, size);
     }
     else if (android_memory_id_map_.find(memory_id) != android_memory_id_map_.end())
@@ -3371,6 +3524,8 @@ void VulkanCppConsumerBase::Generate_vkGetMemoryAndroidHardwareBufferANDROID(
 void VulkanCppConsumerBase::Generate_vkQueueSubmit(args::QueueSubmit& args)
 {
     FILE* file = GetFrameFile();
+    // The queued snapshot uploads must finish before the submitted work can use the resources.
+    fprintf(file, "\tToCppInitFlush();\n");
     fprintf(file, "\t{\n");
     // queue
     // submitCount
@@ -3415,6 +3570,8 @@ void VulkanCppConsumerBase::Generate_vkQueueSubmit(args::QueueSubmit& args)
 void VulkanCppConsumerBase::Generate_vkQueueSubmit2(args::QueueSubmit2& args, const char* extension)
 {
     FILE* file = GetFrameFile();
+    // The queued snapshot uploads must finish before the submitted work can use the resources.
+    fprintf(file, "\tToCppInitFlush();\n");
     fprintf(file, "\t{\n");
     // queue
     // submitCount

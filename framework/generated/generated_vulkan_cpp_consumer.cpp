@@ -1311,6 +1311,7 @@ void VulkanCppConsumer::Process_vkCreateBuffer(
     const ApiCallInfo&                          call_info,
     args::CreateBuffer&                         args)
 {
+    Intercept_vkCreateBuffer(args);
     Generate_vkCreateBuffer(args);
     Post_APICall(format::ApiCallId::ApiCall_vkCreateBuffer);
 }
@@ -1547,6 +1548,7 @@ void VulkanCppConsumer::Process_vkCreateImage(
     const ApiCallInfo&                          call_info,
     args::CreateImage&                          args)
 {
+    Intercept_vkCreateImage(args);
     FILE* file = GetFrameFile();
     fprintf(file, "\t{\n");
     std::stringstream stream_pcreate_info;

@@ -170,7 +170,9 @@ CPP_APICALL_INTERCEPT_LIST = [
     'vkBindImageMemory',
     'vkBindImageMemory2',
     'vkCmdBeginRenderPass',
+    'vkCreateBuffer',
     'vkCreateFramebuffer',
+    'vkCreateImage',
     'vkDestroySemaphore',
 
     'vkBindImageMemory2KHR',

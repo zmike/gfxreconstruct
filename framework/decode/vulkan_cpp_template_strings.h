@@ -210,7 +210,73 @@ extern size_t LoadBinaryData(const char* filename,
                              struct XCBApp& appdata);
 )";
 
-static const char* sXcbOutputOverrideMethod = R"(
+// Reads data from a data pack. The packs are read once at setup, so the file stays open between calls and the
+// bulk of a large aligned read bypasses the page cache, saving the cache fill and a copy.
+#define TOCPP_POSIX_READ_DATA_SOURCE R"(
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <map>
+#include <string>
+
+static size_t ToCppReadData(const char* filename, size_t file_offset, void* dst, size_t size)
+{
+    struct PackFile
+    {
+        int fd;
+        int direct_fd;
+    };
+    static std::map<std::string, PackFile> files;
+
+    auto entry = files.find(filename);
+    if (entry == files.end())
+    {
+        const int fd = open(filename, O_RDONLY);
+        if (fd < 0)
+        {
+            throw std::runtime_error("Error while opening file: " + std::string(filename));
+        }
+        entry = files.emplace(filename, PackFile{ fd, open(filename, O_RDONLY | O_DIRECT) }).first;
+    }
+    PackFile& file = entry->second;
+
+    constexpr size_t kAlignment = 4096;
+    uint8_t*         out        = static_cast<uint8_t*>(dst);
+    size_t           done       = 0;
+
+    if ((file.direct_fd >= 0) && (size >= (1u << 20)) && ((file_offset %% kAlignment) == 0) &&
+        ((reinterpret_cast<uintptr_t>(out) %% kAlignment) == 0))
+    {
+        const size_t bulk = size & ~(kAlignment - 1);
+        while (done < bulk)
+        {
+            const ssize_t count = pread(file.direct_fd, out + done, bulk - done, file_offset + done);
+            if (count <= 0)
+            {
+                // The destination memory does not support direct reads, so do not try again.
+                close(file.direct_fd);
+                file.direct_fd = -1;
+                break;
+            }
+            done += static_cast<size_t>(count);
+        }
+    }
+
+    while (done < size)
+    {
+        const ssize_t count = pread(file.fd, out + done, size - done, file_offset + done);
+        if (count <= 0)
+        {
+            throw std::runtime_error("Error while reading file: " + std::string(filename));
+        }
+        done += static_cast<size_t>(count);
+    }
+    return size;
+}
+)"
+
+static const char* sXcbOutputOverrideMethod = TOCPP_POSIX_READ_DATA_SOURCE R"(
 void OverrideVkXcbSurfaceCreateInfoKHR(VkXcbSurfaceCreateInfoKHR* createInfo,
                                        struct XCBApp& appdata) {
     // Open the connection to the X server
@@ -293,20 +359,7 @@ size_t LoadBinaryData(const char* filename,
                       struct XCBApp& appdata) {
     (void)appdata; // Unused
 
-    FILE* fp = fopen(filename, "rb");
-    if (fp == nullptr) {
-        throw std::runtime_error("Error while opening file: " + std::string(filename));
-    }
-
-    fseek(fp, file_offset, SEEK_SET);
-    size_t read_size = fread((uint8_t*)buffer + offset, sizeof(uint8_t), data_size, fp);
-    if (read_size != data_size) {
-        fclose(fp);
-        throw std::runtime_error("Error while reading file: " + std::string(filename));
-    }
-
-    fclose(fp);
-    return read_size;
+    return ToCppReadData(filename, file_offset, (uint8_t*)buffer + offset, data_size);
 }
 
 XCBApp appdata(%d, %d);
@@ -397,7 +450,7 @@ extern size_t LoadBinaryData(const char* filename,
                              struct WaylandApp& appdata);
 )";
 
-static const char* sWaylandOutputOverrideMethod = R"(
+static const char* sWaylandOutputOverrideMethod = TOCPP_POSIX_READ_DATA_SOURCE R"(
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -557,22 +610,7 @@ size_t LoadBinaryData(const char* filename,
 {
     (void)appdata; // Unused
 
-    FILE* fp = fopen(filename, "rb");
-    if (fp == nullptr)
-    {
-        throw std::runtime_error("Error while opening file: " + std::string(filename));
-    }
-
-    fseek(fp, file_offset, SEEK_SET);
-    size_t read_size = fread((uint8_t *)buffer + offset, sizeof(uint8_t), data_size, fp);
-    if (read_size != data_size)
-    {
-        fclose(fp);
-        throw std::runtime_error("Error while reading file: " + std::string(filename));
-    }
-
-    fclose(fp);
-    return read_size;
+    return ToCppReadData(filename, file_offset, (uint8_t*)buffer + offset, data_size);
 }
 
 WaylandApp appdata(%d, %d);
@@ -1029,6 +1067,7 @@ target_link_libraries(vulkan_app vulkan)
 // Swapchain code
 static const char* sSwapchainHeaderCode = R"(
 #include <cassert>
+#include <vector>
 
 // Device-specific Info
 
@@ -1135,6 +1174,26 @@ VkResult toCppAcquireNextImageKHR(VkResult       expected_result,
                                   uint32_t       captured_index,
                                   uint32_t*      replay_index);
 VkResult toCppQueuePresentKHR(VkQueue queue, VkPresentInfoKHR* pPresentInfo);
+
+// Snapshot data uploads. ToCppInitStaging returns host memory that the caller fills with the data, then the
+// ToCppInitBuffer or ToCppInitImage call queues a copy of it to the resource. The copies are submitted together
+// when the staging memory is full and by ToCppInitFlush, which the program calls before anything that could use
+// the resources or overwrite the staged data.
+void* ToCppInitStaging(VkDevice device, uint64_t size);
+void  ToCppInitFlush();
+void  ToCppInitBuffer(VkDevice device, VkBuffer buffer, uint64_t size);
+void  ToCppInitImage(VkDevice            device,
+                     VkImage             image,
+                     VkFormat            format,
+                     uint32_t            aspect,
+                     VkImageLayout       initial_layout,
+                     VkImageLayout       final_layout,
+                     uint32_t            width,
+                     uint32_t            height,
+                     uint32_t            depth,
+                     uint32_t            level_count,
+                     uint32_t            layer_count,
+                     const uint64_t*     level_offsets);
 )";
 
 static const char* sSwapchainSourceCode_part_1 = R"(
@@ -2005,6 +2064,203 @@ static const char* sSwapchainSourceCode_part_3 = R"(
 #endif
     return loaded_vkQueuePresentKHR(queue, pPresentInfo);
 }
+)";
+
+static const char* sInitDataSourceCode = R"(
+
+// Snapshot data uploads
+
+static struct
+{
+    VkDevice       device{ VK_NULL_HANDLE };
+    VkBuffer       buffer{ VK_NULL_HANDLE };
+    VkDeviceMemory memory{ VK_NULL_HANDLE };
+    void*          ptr{ nullptr };
+    uint64_t       size{ 0 };
+    uint64_t       cursor{ 0 };   // start of the free part of the staging memory
+    uint64_t       base{ 0 };     // start of the data returned by the last ToCppInitStaging call
+    bool           recording{ false };
+    VkQueue        queue{ VK_NULL_HANDLE };
+    VkCommandPool  pool{ VK_NULL_HANDLE };
+    VkCommandBuffer cmd{ VK_NULL_HANDLE };
+} s_init_data;
+
+static void toCppInitDataSetup(VkDevice device)
+{
+    if (s_init_data.queue != VK_NULL_HANDLE)
+    {
+        return;
+    }
+
+    s_init_data.device = device;
+
+    ToCppDeviceInfo* dev_info = g_device_info[device];
+    uint32_t         family   = 0;
+    for (const auto& entry : dev_info->queue_family_info)
+    {
+        if (entry.second.family_props.queueFlags & VK_QUEUE_GRAPHICS_BIT)
+        {
+            family = entry.first;
+            break;
+        }
+    }
+    vkGetDeviceQueue(device, family, 0, &s_init_data.queue);
+
+    VkCommandPoolCreateInfo pool_info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0, family };
+    vkCreateCommandPool(device, &pool_info, nullptr, &s_init_data.pool);
+    VkCommandBufferAllocateInfo alloc_info = {
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, s_init_data.pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1
+    };
+    vkAllocateCommandBuffers(device, &alloc_info, &s_init_data.cmd);
+}
+
+// Submit the queued copies and wait for them. The staging memory is free again afterwards.
+void ToCppInitFlush()
+{
+    if (!s_init_data.recording)
+    {
+        return;
+    }
+
+    vkEndCommandBuffer(s_init_data.cmd);
+    VkSubmitInfo submit_info = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &s_init_data.cmd, 0,
+                                 nullptr };
+    vkQueueSubmit(s_init_data.queue, 1, &submit_info, VK_NULL_HANDLE);
+    vkQueueWaitIdle(s_init_data.queue);
+    s_init_data.recording = false;
+    s_init_data.cursor    = 0;
+}
+
+void* ToCppInitStaging(VkDevice device, uint64_t size)
+{
+    toCppInitDataSetup(device);
+
+    // Page aligned, so the data can be read into it with direct I/O.
+    constexpr uint64_t kAlignment = 4096;
+    constexpr uint64_t kMinSize   = 64u << 20;
+    const uint64_t     aligned    = (size + kAlignment - 1) & ~(kAlignment - 1);
+
+    if (s_init_data.cursor + aligned > s_init_data.size)
+    {
+        ToCppInitFlush();
+    }
+
+    if ((s_init_data.buffer == VK_NULL_HANDLE) || (aligned > s_init_data.size))
+    {
+        if (s_init_data.buffer != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(device, s_init_data.buffer, nullptr);
+            vkFreeMemory(device, s_init_data.memory, nullptr);
+        }
+
+        s_init_data.size = (aligned > kMinSize) ? aligned : kMinSize;
+        VkBufferCreateInfo buffer_info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, s_init_data.size,
+                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+        vkCreateBuffer(device, &buffer_info, nullptr, &s_init_data.buffer);
+
+        VkMemoryRequirements requirements;
+        vkGetBufferMemoryRequirements(device, s_init_data.buffer, &requirements);
+        VkPhysicalDeviceMemoryProperties properties;
+        vkGetPhysicalDeviceMemoryProperties(g_device_info[device]->parent, &properties);
+        const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        uint32_t                    type   = 0;
+        for (uint32_t i = 0; i < properties.memoryTypeCount; ++i)
+        {
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                ((properties.memoryTypes[i].propertyFlags & wanted) == wanted))
+            {
+                type = i;
+                break;
+            }
+        }
+        VkMemoryAllocateInfo allocate_info = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, requirements.size,
+                                               type };
+        vkAllocateMemory(device, &allocate_info, nullptr, &s_init_data.memory);
+        vkBindBufferMemory(device, s_init_data.buffer, s_init_data.memory, 0);
+        vkMapMemory(device, s_init_data.memory, 0, VK_WHOLE_SIZE, 0, &s_init_data.ptr);
+    }
+
+    s_init_data.base = s_init_data.cursor;
+    s_init_data.cursor += aligned;
+    return static_cast<uint8_t*>(s_init_data.ptr) + s_init_data.base;
+}
+
+static void toCppInitDataBegin()
+{
+    if (s_init_data.recording)
+    {
+        return;
+    }
+
+    vkResetCommandBuffer(s_init_data.cmd, 0);
+    VkCommandBufferBeginInfo begin_info = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                                            VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
+    vkBeginCommandBuffer(s_init_data.cmd, &begin_info);
+    s_init_data.recording = true;
+}
+
+void ToCppInitBuffer(VkDevice device, VkBuffer buffer, uint64_t size)
+{
+    toCppInitDataSetup(device);
+    toCppInitDataBegin();
+    VkBufferCopy region = { s_init_data.base, 0, size };
+    vkCmdCopyBuffer(s_init_data.cmd, s_init_data.buffer, buffer, 1, &region);
+}
+
+void ToCppInitImage(VkDevice        device,
+                    VkImage         image,
+                    VkFormat        format,
+                    uint32_t        aspect,
+                    VkImageLayout   initial_layout,
+                    VkImageLayout   final_layout,
+                    uint32_t        width,
+                    uint32_t        height,
+                    uint32_t        depth,
+                    uint32_t        level_count,
+                    uint32_t        layer_count,
+                    const uint64_t* level_offsets)
+{
+    (void)format;
+    toCppInitDataSetup(device);
+    toCppInitDataBegin();
+
+    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr,
+                                     VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     initial_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, image,
+                                     { aspect, 0, level_count, 0, layer_count } };
+    if (level_offsets != nullptr)
+    {
+        vkCmdPipelineBarrier(s_init_data.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                             0, nullptr, 0, nullptr, 1, &barrier);
+
+        std::vector<VkBufferImageCopy> regions(level_count);
+        for (uint32_t i = 0; i < level_count; ++i)
+        {
+            regions[i] = { s_init_data.base + level_offsets[i], 0, 0, { aspect, i, 0, layer_count }, { 0, 0, 0 },
+                           { (width >> i) ? (width >> i) : 1u, (height >> i) ? (height >> i) : 1u,
+                             (depth >> i) ? (depth >> i) : 1u } };
+        }
+        vkCmdCopyBufferToImage(s_init_data.cmd, s_init_data.buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               level_count, regions.data());
+        barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    }
+    else
+    {
+        barrier.oldLayout = initial_layout;
+    }
+
+    if ((final_layout != VK_IMAGE_LAYOUT_UNDEFINED) && (final_layout != VK_IMAGE_LAYOUT_PREINITIALIZED) &&
+        (final_layout != barrier.oldLayout))
+    {
+        barrier.newLayout     = final_layout;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(s_init_data.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+}
+
 )";
 
 GFXRECON_END_NAMESPACE(gfxrecon)

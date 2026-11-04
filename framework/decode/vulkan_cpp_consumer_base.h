@@ -32,6 +32,7 @@
 #include <string>
 #include <sstream>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <queue>
 
@@ -48,6 +49,17 @@ struct DescriptorUpdateTemplateEntries
     std::vector<VkDescriptorUpdateTemplateEntry> texels;
     std::vector<VkDescriptorUpdateTemplateEntry> accelerations;
     std::vector<VkDescriptorUpdateTemplateEntry> inline_uniform_blocks;
+};
+
+// What an InitImageCommand needs to know about the image it initializes.
+struct VulkanCppImageInitInfo
+{
+    VkFormat        format{ VK_FORMAT_UNDEFINED };
+    VkExtent3D      extent{};
+    uint32_t        level_count{ 1 };
+    uint32_t        layer_count{ 1 };
+    VkImageLayout   initial_layout{ VK_IMAGE_LAYOUT_UNDEFINED };
+    VkSampleCountFlagBits sample_count{ VK_SAMPLE_COUNT_1_BIT };
 };
 
 // Track items that are specific to a given device
@@ -295,6 +307,11 @@ class VulkanCppConsumerBase : public VulkanConsumer
 
     void Intercept_vkCreateFramebuffer(args::CreateFramebuffer& args);
 
+    // Add the transfer usage that the snapshot data uploads need, and remember what they need to know about the image.
+    void Intercept_vkCreateBuffer(args::CreateBuffer& args);
+
+    void Intercept_vkCreateImage(args::CreateImage& args);
+
     void Intercept_vkCreateSwapchainKHR(args::CreateSwapchainKHR& args);
 
     void Intercept_vkDestroySemaphore(args::DestroySemaphore& args);
@@ -394,6 +411,19 @@ class VulkanCppConsumerBase : public VulkanConsumer
     virtual void
     ProcessFillMemoryCommand(uint64_t memory_id, uint64_t offset, uint64_t size, const uint8_t* data) override;
 
+    virtual void ProcessInitBufferCommand(format::HandleId device_id,
+                                          format::HandleId buffer_id,
+                                          uint64_t         data_size,
+                                          const uint8_t*   data) override;
+
+    virtual void ProcessInitImageCommand(format::HandleId             device_id,
+                                         format::HandleId             image_id,
+                                         uint64_t                     data_size,
+                                         uint32_t                     aspect,
+                                         uint32_t                     layout,
+                                         const std::vector<uint64_t>& level_sizes,
+                                         const uint8_t*               data) override;
+
     virtual void ProcessResizeWindowCommand(format::HandleId surface_id, uint32_t width, uint32_t height) override;
 
     virtual void ProcessResizeWindowCommand2(format::HandleId surface_id,
@@ -453,6 +483,7 @@ class VulkanCppConsumerBase : public VulkanConsumer
     VulkanCppLoaderGenerator                                              pfn_loader_;
     std::unordered_map<format::HandleId, std::string>                     handle_id_map_;
     std::unordered_map<format::HandleId, VkDeviceInfo*>                   device_info_map_;
+    std::unordered_map<format::HandleId, VulkanCppImageInitInfo>          image_init_info_map_;
     std::vector<std::string>                                              func_data_;
     std::unordered_map<uint64_t, std::string>                             memory_id_map_;
     std::unordered_map<uint64_t, VulkanCppAndroidBufferInfo>              android_buffer_id_map_;
