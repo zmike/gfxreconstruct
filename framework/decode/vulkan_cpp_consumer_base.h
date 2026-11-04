@@ -259,6 +259,7 @@ class VulkanCppConsumerBase : public VulkanConsumer
     void Generate_vkCmdPushDescriptorSetWithTemplate2(args::CmdPushDescriptorSetWithTemplate2& args,
                                                       const char*                              extension = "");
 
+    void EmitPipelineTaskEnd(FILE* file, const std::string& create_infos_text, const std::string& pipeline_var_name);
     void Generate_vkCreateGraphicsPipelines(args::CreateGraphicsPipelines& args);
     void Generate_vkCreateComputePipelines(args::CreateComputePipelines& args);
     void Generate_vkCreateRayTracingPipelinesKHR(args::CreateRayTracingPipelinesKHR& args);
@@ -510,6 +511,10 @@ class VulkanCppConsumerBase : public VulkanConsumer
     bool WriteGlobalHeaderFile();
     void PrintOutGlobalVar();
     bool WriteSwapchainFiles();
+
+    // Threaded pipeline creation: task id of the create that made each pipeline variable.
+    uint32_t                                 next_pipeline_task_id_{ 0 };
+    std::unordered_map<std::string, uint32_t> pipeline_task_ids_;
 
     struct FrameTempMemory
     {

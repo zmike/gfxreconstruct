@@ -373,7 +373,8 @@ include_directories(${PROJECT_SOURCE_DIR}/src/)
 file(GLOB SRC_FILES ${PROJECT_SOURCE_DIR}/src/*.cpp)
 file(GLOB MAIN_FILE ${PROJECT_SOURCE_DIR}/*.cpp)
 add_executable(vulkan_app ${SRC_FILES} ${MAIN_FILE})
-target_link_libraries(vulkan_app vulkan xcb)
+find_package(Threads REQUIRED)
+target_link_libraries(vulkan_app vulkan xcb Threads::Threads)
 )";
 // End of Xcb template strings
 
@@ -639,7 +640,8 @@ add_executable(vulkan_app ${SRC_FILES} ${MAIN_FILE} ${XDG_SHELL_PROTOCOL_C})
 find_package(Vulkan REQUIRED)
 find_package(PkgConfig)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
-target_link_libraries(vulkan_app Vulkan::Vulkan ${WAYLAND_CLIENT_LIBRARIES})
+find_package(Threads REQUIRED)
+target_link_libraries(vulkan_app Vulkan::Vulkan ${WAYLAND_CLIENT_LIBRARIES} Threads::Threads)
 )";
 // End of Wayland template strings
 
@@ -1060,12 +1062,14 @@ target_compile_definitions(vulkan_app PRIVATE
     _CRT_SECURE_NO_WARNINGS
     VK_NO_PROTOTYPES
 )
-target_link_libraries(vulkan_app vulkan)
+find_package(Threads REQUIRED)
+target_link_libraries(vulkan_app vulkan Threads::Threads)
 )";
 // End of Win32 template strings
 
 // Swapchain code
 static const char* sSwapchainHeaderCode = R"(
+#include <atomic>
 #include <cassert>
 #include <vector>
 
@@ -1194,11 +1198,50 @@ void  ToCppInitImage(VkDevice            device,
                      uint32_t            level_count,
                      uint32_t            layer_count,
                      const uint64_t*     level_offsets);
+
+// Threaded pipeline creation. Each vkCreate*Pipelines block of the setup runs as a task on a worker pool
+// (TOCPP_PIPELINE_THREADS overrides the thread count, 0 runs them inline). A task starts after the earlier tasks
+// it lists, which made the pipelines its create infos read. ToCppPipelineJoin waits for every task; the macros below
+// call it before anything that could use or invalidate what a task reads or writes.
+extern std::atomic<uint32_t> g_toCppPendingPipelines;
+void ToCppPipelineAsync(void (*create)(), uint32_t task_id, std::vector<uint32_t> deps);
+void ToCppPipelineJoin();
+static inline void ToCppPipelineJoinIfPending()
+{
+    if (g_toCppPendingPipelines.load(std::memory_order_acquire) != 0)
+    {
+        ToCppPipelineJoin();
+    }
+}
+
+#define ToCppJoinBefore_(call, ...) (ToCppPipelineJoinIfPending(), call(__VA_ARGS__))
+#define vkCmdBindPipeline(...) ToCppJoinBefore_(vkCmdBindPipeline, __VA_ARGS__)
+#define vkDestroyPipeline(...) ToCppJoinBefore_(vkDestroyPipeline, __VA_ARGS__)
+#define vkDestroyShaderModule(...) ToCppJoinBefore_(vkDestroyShaderModule, __VA_ARGS__)
+#define vkDestroyPipelineLayout(...) ToCppJoinBefore_(vkDestroyPipelineLayout, __VA_ARGS__)
+#define vkDestroyDescriptorSetLayout(...) ToCppJoinBefore_(vkDestroyDescriptorSetLayout, __VA_ARGS__)
+#define vkDestroyRenderPass(...) ToCppJoinBefore_(vkDestroyRenderPass, __VA_ARGS__)
+#define vkDestroyPipelineCache(...) ToCppJoinBefore_(vkDestroyPipelineCache, __VA_ARGS__)
+#define vkDestroyDevice(...) ToCppJoinBefore_(vkDestroyDevice, __VA_ARGS__)
+#define vkDeviceWaitIdle(...) ToCppJoinBefore_(vkDeviceWaitIdle, __VA_ARGS__)
+#define vkQueueSubmit(...) ToCppJoinBefore_(vkQueueSubmit, __VA_ARGS__)
+#define vkQueueSubmit2(...) ToCppJoinBefore_(vkQueueSubmit2, __VA_ARGS__)
+#define vkQueueSubmit2KHR(...) ToCppJoinBefore_(vkQueueSubmit2KHR, __VA_ARGS__)
+#define vkQueueBindSparse(...) ToCppJoinBefore_(vkQueueBindSparse, __VA_ARGS__)
+#define vkGetRayTracingShaderGroupHandlesKHR(...) ToCppJoinBefore_(vkGetRayTracingShaderGroupHandlesKHR, __VA_ARGS__)
+#define vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(...) \
+    ToCppJoinBefore_(vkGetRayTracingCaptureReplayShaderGroupHandlesKHR, __VA_ARGS__)
+#define vkDestroyInstance(...) ToCppJoinBefore_(vkDestroyInstance, __VA_ARGS__)
 )";
 
 static const char* sSwapchainSourceCode_part_1 = R"(
 #include "global_var.h"
 #include "loader.h"
+
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include "swapchain_common.h"
 
 #include <inttypes.h>
@@ -2261,6 +2304,115 @@ void ToCppInitImage(VkDevice        device,
     }
 }
 
+// Threaded pipeline creation
+
+std::atomic<uint32_t> g_toCppPendingPipelines{ 0 };
+
+namespace
+{
+struct PipelineTask
+{
+    void (*create)();
+    uint32_t              id;
+    std::vector<uint32_t> deps;
+};
+
+// Never destroyed: the workers are detached and may still wait on it while the program exits.
+struct PipelinePool
+{
+    std::mutex                mutex;
+    std::condition_variable   work_cv;   // a task was queued
+    std::condition_variable   done_cv;   // a task finished
+    std::deque<PipelineTask>  queue;
+    std::vector<char>         done;      // indexed by task id
+    uint32_t                  pending{ 0 };
+    uint32_t                  threads{ 0 };
+};
+
+PipelinePool* ToCppPipelinePool()
+{
+    static PipelinePool* pool = new PipelinePool;
+    return pool;
+}
+
+void ToCppPipelineWorker()
+{
+    PipelinePool*                pool = ToCppPipelinePool();
+    std::unique_lock<std::mutex> lock(pool->mutex);
+    for (;;)
+    {
+        pool->work_cv.wait(lock, [pool] { return !pool->queue.empty(); });
+        PipelineTask task = std::move(pool->queue.front());
+        pool->queue.pop_front();
+
+        // Tasks start in queue order and depend on earlier ones only, so every dependency has been taken by
+        // some worker and the wait ends.
+        pool->done_cv.wait(lock, [&] {
+            for (uint32_t dep : task.deps)
+            {
+                if (!pool->done[dep])
+                {
+                    return false;
+                }
+            }
+            return true;
+        });
+
+        lock.unlock();
+        task.create();
+        lock.lock();
+
+        pool->done[task.id] = 1;
+        --pool->pending;
+        g_toCppPendingPipelines.store(pool->pending, std::memory_order_release);
+        pool->done_cv.notify_all();
+    }
+}
+} // namespace
+
+void ToCppPipelineAsync(void (*create)(), uint32_t task_id, std::vector<uint32_t> deps)
+{
+    PipelinePool* pool = ToCppPipelinePool();
+
+    static const uint32_t thread_count = [] {
+        const char* env = getenv("TOCPP_PIPELINE_THREADS");
+        if (env != nullptr)
+        {
+            const long count = strtol(env, nullptr, 10);
+            return (uint32_t)(count < 0 ? 0 : (count > 64 ? 64 : count));
+        }
+        const uint32_t cores = std::thread::hardware_concurrency();
+        return (cores > 16) ? 16u : cores;
+    }();
+
+    if (thread_count == 0)
+    {
+        create();
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    if (pool->done.size() <= task_id)
+    {
+        pool->done.resize(task_id + 1, 0);
+    }
+    while (pool->threads < thread_count)
+    {
+        std::thread(ToCppPipelineWorker).detach();
+        ++pool->threads;
+    }
+    pool->queue.push_back({ create, task_id, std::move(deps) });
+    ++pool->pending;
+    g_toCppPendingPipelines.store(pool->pending, std::memory_order_release);
+    pool->work_cv.notify_one();
+}
+
+void ToCppPipelineJoin()
+{
+    PipelinePool*                pool = ToCppPipelinePool();
+    std::unique_lock<std::mutex> lock(pool->mutex);
+    pool->done_cv.wait(lock, [pool] { return pool->pending == 0; });
+}
 )";
 
 GFXRECON_END_NAMESPACE(gfxrecon)

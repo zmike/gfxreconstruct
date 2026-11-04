@@ -32,6 +32,8 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <regex>
+#include <set>
 
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 GFXRECON_BEGIN_NAMESPACE(decode)
@@ -504,6 +506,7 @@ void VulkanCppConsumerBase::EndFrameFile(uint32_t frameNumber, uint32_t frameSpl
     assert(main_file_ != nullptr);
 
     // Write out closing data for previous frame file.
+    fprintf(frame_file_, "\tToCppPipelineJoin();\n");
     fprintf(frame_file_, "\tToCppInitFlush();\n");
     fprintf(frame_file_, "%s", sCommonFrameSourceFooter);
     util::platform::FileClose(frame_file_);
@@ -2419,10 +2422,40 @@ void VulkanCppConsumerBase::Generate_vkSetDebugUtilsObjectTagEXT(args::SetDebugU
 void VulkanCppConsumerBase::Generate_vkDebugMarkerSetObjectNameEXT(args::DebugMarkerSetObjectNameEXT& args) {}
 void VulkanCppConsumerBase::Generate_vkDebugMarkerSetObjectTagEXT(args::DebugMarkerSetObjectTagEXT& args) {}
 
+// Close a threaded pipeline create block: give the task an id and list the earlier creates whose handles its create
+// infos read (pipeline library parts, base pipelines), so it only starts after they finish.
+void VulkanCppConsumerBase::EmitPipelineTaskEnd(FILE*              file,
+                                                const std::string& create_infos_text,
+                                                const std::string& pipeline_var_name)
+{
+    const uint32_t    task_id = next_pipeline_task_id_++;
+    std::set<uint32_t> deps;
+    static const std::regex pipeline_ref("pPipelines_[0-9]+");
+    for (auto it = std::sregex_iterator(create_infos_text.begin(), create_infos_text.end(), pipeline_ref);
+         it != std::sregex_iterator();
+         ++it)
+    {
+        auto task = pipeline_task_ids_.find(it->str());
+        if (task != pipeline_task_ids_.end())
+        {
+            deps.insert(task->second);
+        }
+    }
+    pipeline_task_ids_[pipeline_var_name] = task_id;
+
+    fprintf(file, "    }, %u, {", task_id);
+    for (uint32_t dep : deps)
+    {
+        fprintf(file, "%u, ", dep);
+    }
+    fprintf(file, "});\n");
+}
+
 void VulkanCppConsumerBase::Generate_vkCreateGraphicsPipelines(args::CreateGraphicsPipelines& args)
 {
     FILE* file = GetFrameFile();
-    fprintf(file, "    {\n");
+    // The create runs on a worker thread; the whole block is the task, so its locals live there.
+    fprintf(file, "    ToCppPipelineAsync([]() {\n");
     // device
     // pipelineCache
     // createInfoCount
@@ -2470,7 +2503,7 @@ void VulkanCppConsumerBase::Generate_vkCreateGraphicsPipelines(args::CreateGraph
             "nullptr",
             pipeline_var_name.c_str(),
             util::ToString<VkResult>(args.result).c_str());
-    fprintf(file, "    }\n");
+    EmitPipelineTaskEnd(file, stream_create_infos.str(), pipeline_var_name);
 }
 
 void VulkanCppConsumerBase::Generate_vkCreateRayTracingPipelinesKHR(args::CreateRayTracingPipelinesKHR& args)
@@ -2530,7 +2563,8 @@ void VulkanCppConsumerBase::Generate_vkCreateRayTracingPipelinesKHR(args::Create
 void VulkanCppConsumerBase::Generate_vkCreateComputePipelines(args::CreateComputePipelines& args)
 {
     FILE* file = GetFrameFile();
-    fprintf(file, "    {\n");
+    // The create runs on a worker thread; the whole block is the task, so its locals live there.
+    fprintf(file, "    ToCppPipelineAsync([]() {\n");
     // device
     // pipelineCache
     // createInfoCount
@@ -2578,7 +2612,7 @@ void VulkanCppConsumerBase::Generate_vkCreateComputePipelines(args::CreateComput
             "nullptr",
             pipeline_var_name.c_str(),
             util::ToString<VkResult>(args.result).c_str());
-    fprintf(file, "    }\n");
+    EmitPipelineTaskEnd(file, stream_create_infos.str(), pipeline_var_name);
 }
 
 void VulkanCppConsumerBase::Generate_vkGetSemaphoreWin32HandleKHR(args::GetSemaphoreWin32HandleKHR& args)
