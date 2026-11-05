@@ -42,8 +42,15 @@
 #include "util/platform.h"
 
 #include <cassert>
+#include <cerrno>
 #include <cstdlib>
 #include <unordered_map>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 #if defined(__unix__)
 extern char** environ;
@@ -140,6 +147,8 @@ CommonCaptureManager::~CommonCaptureManager()
     {
         util::PageGuardManager::Destroy();
     }
+
+    UnlockCaptureFile();
 
     util::Log::Release();
 }
@@ -1271,6 +1280,75 @@ std::string CommonCaptureManager::CreateAssetFilename(const std::string& base_fi
     return asset_filename;
 }
 
+#if defined(__linux__)
+// Returns an fd holding the lock on filename, or -1 with *busy set when another process holds it. Any other failure
+// also returns -1: the normal open of the capture file then reports it.
+static int TryLockFile(const std::string& filename, bool* busy)
+{
+    *busy  = false;
+    int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
+    if ((fd != -1) && (flock(fd, LOCK_EX | LOCK_NB) != 0))
+    {
+        const int error = errno;
+        *busy           = (error == EWOULDBLOCK);
+        if (!*busy)
+        {
+            GFXRECON_LOG_WARNING("Cannot lock capture file %s (errno %d: %s); other processes capturing to the same "
+                                 "name are not detected",
+                                 filename.c_str(),
+                                 error,
+                                 strerror(error));
+        }
+        close(fd);
+        fd = -1;
+    }
+    return fd;
+}
+#endif
+
+// Several processes of one application (for example the Wine and Proton helper processes of a game) can load
+// the capture layer and resolve the same capture file name. Opening it with "wb" truncates it, and the writers
+// then overwrite each other's blocks at unrelated offsets, which corrupts the file. Hold an advisory lock on the
+// file for as long as it is being captured to: a process that finds the name locked by another live process
+// captures to a name with its process id appended instead. A name that is not locked (a finished capture) is
+// still overwritten as before. The lock is taken before the file is opened, so the truncation never touches a
+// file another process is writing to. A child that forks without exec keeps the lock after the parent releases
+// it; that only makes a later capture of the same name use a pid name. Linux only; other platforms are unprotected.
+void CommonCaptureManager::LockCaptureFile(std::string* filename)
+{
+#if defined(__linux__)
+    UnlockCaptureFile();
+
+    bool busy;
+    int  fd = TryLockFile(*filename, &busy);
+    if (busy)
+    {
+        *filename = util::filepath::InsertFilenamePostfix(*filename, "_pid" + std::to_string(getpid()));
+        GFXRECON_LOG_WARNING("Capture file is being written by another process; capturing to %s instead",
+                             filename->c_str());
+        fd = TryLockFile(*filename, &busy);
+        if (busy)
+        {
+            GFXRECON_LOG_WARNING("%s is also locked; its capture may be overwritten", filename->c_str());
+        }
+    }
+    capture_lock_fd_ = fd;
+#else
+    GFXRECON_UNREFERENCED_PARAMETER(filename);
+#endif
+}
+
+void CommonCaptureManager::UnlockCaptureFile()
+{
+#if defined(__linux__)
+    if (capture_lock_fd_ != -1)
+    {
+        close(capture_lock_fd_);
+        capture_lock_fd_ = -1;
+    }
+#endif
+}
+
 bool CommonCaptureManager::CreateCaptureFile(format::ApiFamilyId api_family, const std::string& base_filename)
 {
     bool success = true;
@@ -1284,6 +1362,8 @@ bool CommonCaptureManager::CreateCaptureFile(format::ApiFamilyId api_family, con
     {
         capture_filename_ = util::filepath::GenerateTimestampedFilename(capture_filename_);
     }
+
+    LockCaptureFile(&capture_filename_);
 
     file_stream_ = std::make_unique<CaptureFileOutputStream>(this, capture_filename_, kFileStreamBufferSize);
 
@@ -1360,7 +1440,8 @@ bool CommonCaptureManager::CreateCaptureFile(format::ApiFamilyId api_family, con
     else
     {
         file_stream_ = nullptr;
-        success      = false;
+        UnlockCaptureFile();
+        success = false;
     }
 
     return success;
@@ -1437,6 +1518,7 @@ void CommonCaptureManager::DeactivateTrimming(std::shared_lock<ApiCallMutexT>& c
         assert(file_stream_);
         file_stream_->Flush();
         file_stream_ = nullptr;
+        UnlockCaptureFile();
     }
 
     if (has_shared_lock)

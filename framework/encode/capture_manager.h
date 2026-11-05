@@ -507,6 +507,8 @@ class CommonCaptureManager
     std::unique_ptr<util::FileOutputStream> CreateAssetFile();
     std::string                             CreateAssetFilename(const std::string& base_filename) const;
     bool CreateCaptureFile(format::ApiFamilyId api_family, const std::string& base_filename);
+    void LockCaptureFile(std::string* filename);
+    void UnlockCaptureFile();
     void WriteCaptureOptions(std::string& operation_annotation);
     void ActivateTrimming(std::shared_lock<ApiCallMutexT>& current_lock);
     void DeactivateTrimming(std::shared_lock<ApiCallMutexT>& current_lock);
@@ -611,6 +613,7 @@ class CommonCaptureManager
     format::EnabledOptions                  file_options_;
     std::string                             base_filename_;
     std::string                             capture_filename_;
+    int                                     capture_lock_fd_{ -1 }; // POSIX: advisory lock on capture_filename_
     format::ApiFamilyId                     capture_file_api_family_;
     std::string                             asset_file_name_;
     bool                                    timestamp_filename_;
