@@ -5847,7 +5847,19 @@ void VulkanReplayConsumer::Process_vkWaitForPresent2KHR(
     const VkPresentWait2InfoKHR* in_pPresentWait2Info = args.pPresentWait2Info.GetPointer();
     MapStructHandles(args.pPresentWait2Info.GetMetaStructPointer(), GetObjectInfoTable());
 
-    VkResult replay_result = GetDeviceTable(in_device)->WaitForPresent2KHR(in_device, in_swapchain, in_pPresentWait2Info);
+    // Trimmed traces can wait on a present id that was never presented; bound the wait so replay cannot hang.
+    VkPresentWait2InfoKHR bounded_wait = *in_pPresentWait2Info;
+    constexpr uint64_t kMaxWaitNs = 200000000ull;
+    if (bounded_wait.timeout > kMaxWaitNs)
+    {
+        bounded_wait.timeout = kMaxWaitNs;
+    }
+    VkResult replay_result = GetDeviceTable(in_device)->WaitForPresent2KHR(in_device, in_swapchain, &bounded_wait);
+    if (replay_result == VK_TIMEOUT && args.result != VK_TIMEOUT)
+    {
+        GFXRECON_LOG_WARNING("vkWaitForPresent2KHR timed out (present id never presented?); continuing.");
+        return;
+    }
     CheckResult("vkWaitForPresent2KHR", args.result, replay_result, call_info);
 }
 
