@@ -1922,6 +1922,110 @@ VkResult toCppAcquireNextImage2KHR(VkResult                         expected_res
     return result;
 }
 
+// Debug aid: with TOCPP_DUMP_PPM=<prefix> set, write each presented virtual image to <prefix><n>.ppm.
+static void toCppDumpPresentedImage(VkQueue queue, ToCppSwapchainInfo* info, VkImage image)
+{
+    static const char* prefix = getenv("TOCPP_DUMP_PPM");
+    static uint32_t    count  = 0;
+    if (prefix == nullptr)
+    {
+        return;
+    }
+    const bool bgr = info->image_format == VK_FORMAT_B8G8R8A8_UNORM || info->image_format == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!bgr && info->image_format != VK_FORMAT_R8G8B8A8_UNORM && info->image_format != VK_FORMAT_R8G8B8A8_SRGB)
+    {
+        printf("TOCPP_DUMP_PPM: unsupported swapchain format %d\n", static_cast<int>(info->image_format));
+        return;
+    }
+    VkDevice device = info->parent;
+    uint32_t w = info->image_extent.width, h = info->image_extent.height;
+    VkDeviceSize size = VkDeviceSize(w) * h * 4;
+
+    VkBufferCreateInfo buffer_info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, nullptr, 0, size,
+                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, nullptr };
+    VkBuffer buffer;
+    vkCreateBuffer(device, &buffer_info, nullptr, &buffer);
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(device, buffer, &reqs);
+    VkPhysicalDeviceMemoryProperties props;
+    vkGetPhysicalDeviceMemoryProperties(g_device_info[device]->parent, &props);
+    const VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    uint32_t type = 0;
+    for (uint32_t i = 0; i < props.memoryTypeCount; ++i)
+    {
+        if ((reqs.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & wanted) == wanted)
+        {
+            type = i;
+            break;
+        }
+    }
+    VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, nullptr, reqs.size, type };
+    VkDeviceMemory       memory;
+    vkAllocateMemory(device, &alloc, nullptr, &memory);
+    vkBindBufferMemory(device, buffer, memory, 0);
+
+    VkCommandPoolCreateInfo pool_info = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0,
+                                          g_queue_info[queue].family_index };
+    VkCommandPool pool;
+    vkCreateCommandPool(device, &pool_info, nullptr, &pool);
+    VkCommandBufferAllocateInfo cb_info = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, pool,
+                                            VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &cb_info, &cmd);
+    VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, nullptr,
+                                       VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, nullptr };
+    vkBeginCommandBuffer(cmd, &begin);
+    VkImageMemoryBarrier barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, nullptr, VK_ACCESS_MEMORY_WRITE_BIT,
+                                     VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_QUEUE_FAMILY_IGNORED,
+                                     VK_QUEUE_FAMILY_IGNORED, image,
+                                     { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+    VkBufferImageCopy region = { 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { 0, 0, 0 }, { w, h, 1 } };
+    vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+    barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &barrier);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submit = { VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cmd, 0, nullptr };
+    // Present waits on the earlier copy submission through the queue order; idle first to be sure the frame is done.
+    vkQueueWaitIdle(queue);
+    vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+
+    void* ptr = nullptr;
+    vkMapMemory(device, memory, 0, size, 0, &ptr);
+    char name[512];
+    snprintf(name, sizeof(name), "%s%u.ppm", prefix, count++);
+    if (FILE* f = fopen(name, "wb"))
+    {
+        fprintf(f, "P6\n%u %u\n255\n", w, h);
+        const uint8_t* src = static_cast<const uint8_t*>(ptr);
+        std::vector<uint8_t> row(size_t(w) * 3);
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint8_t* px = src + (size_t(y) * w + x) * 4;
+                row[x * 3 + 0]    = px[bgr ? 2 : 0];
+                row[x * 3 + 1]    = px[1];
+                row[x * 3 + 2]    = px[bgr ? 0 : 2];
+            }
+            fwrite(row.data(), 1, row.size(), f);
+        }
+        fclose(f);
+        printf("TOCPP_DUMP_PPM: wrote %s\n", name);
+    }
+    vkUnmapMemory(device, memory);
+    vkDestroyCommandPool(device, pool, nullptr);
+    vkDestroyBuffer(device, buffer, nullptr);
+    vkFreeMemory(device, memory, nullptr);
+}
+
 VkResult toCppQueuePresentKHR(VkQueue queue, VkPresentInfoKHR* pPresentInfo)
 {
 #if USE_VIRTUAL_SWAPCHAIN
@@ -2141,6 +2245,17 @@ static const char* sSwapchainSourceCode_part_3 = R"(
             if (result != VK_SUCCESS)
             {
                 return result;
+            }
+        }
+
+        for (uint32_t i = 0; i < swapchain_count; ++i)
+        {
+            auto it = g_swapchain_info.find(pPresentInfo->pSwapchains[i]);
+            if (it != g_swapchain_info.end())
+            {
+                ToCppSwapchainInfo* info = it->second;
+                uint32_t            cap  = info->acquired_indices[pPresentInfo->pImageIndices[i]].index;
+                toCppDumpPresentedImage(queue, info, info->virtual_images[cap].image);
             }
         }
 
