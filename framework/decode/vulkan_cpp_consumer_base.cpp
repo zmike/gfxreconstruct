@@ -445,6 +445,7 @@ bool VulkanCppConsumerBase::Initialize(const std::string&      filename,
     // will always attempt to use them (listed alphabetically).  This only gets the toCpp loader.h/.cpp
     // code to attempt to pre-load the functions so that they are accessible as "loaded_(func_name)"
     // functions and adds no logic forcing them to be used otherwise.
+    pfn_loader_.AddMethodName("vkAcquireNextImage2KHR");
     pfn_loader_.AddMethodName("vkAcquireNextImageKHR");
     pfn_loader_.AddMethodName("vkCreateSwapchainKHR");
     pfn_loader_.AddMethodName("vkDestroySwapchainKHR");
@@ -681,11 +682,28 @@ void VulkanCppConsumerBase::Generate_vkGetSwapchainImagesKHR(args::GetSwapchainI
     }
     else
     {
+        // A trimmed or re-captured file can hold this call without the count query that normally precedes it, so
+        // query the replay count here instead of looking it up from that query.
+        uint32_t images_count = 0;
+        if (args.pSwapchainImageCount.GetPointer() != nullptr)
+        {
+            images_count = *args.pSwapchainImageCount.GetPointer();
+        }
+        const std::string swapchain_image_count_var_name = "pSwapchainImageCount_" + std::to_string(GetNextId());
+        AddKnownVariables("uint32_t", swapchain_image_count_var_name);
+        ptr_map_[&args.pSwapchainImageCount] = swapchain_image_count_var_name;
+        fprintf(file,
+                "\tVK_CALL_CHECK(toCppGetSwapchainImagesKHR(%s, %s, %u, &%s, NULL), VK_SUCCESS);\n",
+                GetHandle(args.device).c_str(),
+                handle_id_map_[args.swapchain].c_str(),
+                images_count,
+                swapchain_image_count_var_name.c_str());
+
         swapchain_images_var_name = "pSwapchainImages_" + std::to_string(GetNextId());
         fprintf(file,
                 "\t%s = new VkImage[%s];\n",
                 swapchain_images_var_name.c_str(),
-                ptr_map_[&args.pSwapchainImageCount].c_str());
+                swapchain_image_count_var_name.c_str());
         AddKnownVariables("VkImage*", swapchain_images_var_name);
         if (args.result == VK_SUCCESS)
         {
@@ -1044,9 +1062,10 @@ void VulkanCppConsumerBase::Generate_vkAllocateMemory(args::AllocateMemory& args
             fprintf(file, "\t\t\t    dev_info->features.features_1_2.bufferDeviceAddressCaptureReplay) {\n");
             fprintf(file, "\t\t\t\tcan_use_opaque_address = true;\n");
             fprintf(file,
-                    "\t\t\t\taddress_info.opaque_address = %" PRIu64 "ULL;\n",
+                    "\t\t\t\taddress_info.opaqueCaptureAddress = %" PRIu64 "ULL;\n",
                     dev_info->opaque_addresses[memory_handle]);
             fprintf(file, "\t\t\t}\n");
+            fprintf(file, "\t\t}\n");
             fprintf(file, "\n");
         }
     }
@@ -1076,7 +1095,7 @@ void VulkanCppConsumerBase::Generate_vkAllocateMemory(args::AllocateMemory& args
                 "\t\t\t\t// The Vulkan spec states: If the pNext chain includes a VkImportMemoryHostPointerInfoEXT\n");
         fprintf(file,
                 "\t\t\t\t// structure, VkMemoryOpaqueCaptureAddressAllocateInfo::opaqueCaptureAddress must be zer\n");
-        fprintf(file, "\t\t\t\taddress_info.opaque_address = 0;\n");
+        fprintf(file, "\t\t\t\taddress_info.opaqueCaptureAddress = 0;\n");
         fprintf(file, "\t\t\t}\n");
         fprintf(file, "\t\t\taddress_info.pNext = %s.pNext;\n", alloc_info_struct_var_name.c_str());
         fprintf(file, "\t\t\t%s.pNext = &address_info;\n", alloc_info_struct_var_name.c_str());
@@ -1787,26 +1806,22 @@ void VulkanCppConsumerBase::Generate_vkAcquireNextImage2KHR(args::AcquireNextIma
         stream_acquire_info, args.pAcquireInfo.GetPointer(), args.pAcquireInfo.GetMetaStructPointer(), *this);
     fprintf(file, "\n%s", stream_acquire_info.str().c_str());
     std::string image_index_var_name = "pImageIndex_" + std::to_string(GetNextId());
-    fprintf(file, "\tuint32_t %s;\n", image_index_var_name.c_str());
+
+    // The index is global, like the one of vkAcquireNextImageKHR, so a later vkQueuePresentKHR can use it.
+    AddKnownVariables("uint32_t", image_index_var_name);
+    next_image_map_[args.pAcquireInfo.GetMetaStructPointer()->swapchain].push(image_index_var_name);
+
     pfn_loader_.AddMethodName("vkAcquireNextImage2KHR");
 
-    if (args.result == VK_SUCCESS)
-    {
-        fprintf(file,
-                "\twhile (loaded_vkAcquireNextImage2KHR(%s, %s, &%s)) != VK_SUCCESS) { usleep(5000); };\n",
-                GetHandle(args.device).c_str(),
-                acquire_info_var_name.c_str(),
-                image_index_var_name.c_str());
-    }
-    else
-    {
-        fprintf(file,
-                "\tVK_CALL_CHECK(loaded_vkAcquireNextImage2KHR(%s, &%s, &%s), %s);\n",
-                GetHandle(args.device).c_str(),
-                acquire_info_var_name.c_str(),
-                image_index_var_name.c_str(),
-                util::ToString<VkResult>(args.result).c_str());
-    }
+    // The wrapper records the captured versus replay image index for the virtual swapchain.
+    fprintf(file,
+            "\tVK_CALL_CHECK(toCppAcquireNextImage2KHR(static_cast<VkResult>(0x%08x), %s, &%s, %u, &%s), %s);\n",
+            args.result,
+            GetHandle(args.device).c_str(),
+            acquire_info_var_name.c_str(),
+            *args.pImageIndex.GetPointer(),
+            image_index_var_name.c_str(),
+            util::ToString<VkResult>(args.result).c_str());
 }
 
 void VulkanCppConsumerBase::Generate_vkWaitForFences(args::WaitForFences& args)

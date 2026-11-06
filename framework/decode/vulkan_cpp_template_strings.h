@@ -1177,6 +1177,11 @@ VkResult toCppAcquireNextImageKHR(VkResult       expected_result,
                                   VkFence        fence,
                                   uint32_t       captured_index,
                                   uint32_t*      replay_index);
+VkResult toCppAcquireNextImage2KHR(VkResult                       expected_result,
+                                   VkDevice                       device,
+                                   const VkAcquireNextImageInfoKHR* acquire_info,
+                                   uint32_t                       captured_index,
+                                   uint32_t*                      replay_index);
 VkResult toCppQueuePresentKHR(VkQueue queue, VkPresentInfoKHR* pPresentInfo);
 
 // Snapshot data uploads. ToCppInitStaging returns host memory that the caller fills with the data, then the
@@ -1861,6 +1866,45 @@ VkResult toCppAcquireNextImageKHR(VkResult       expected_result,
 
 #if USE_VIRTUAL_SWAPCHAIN
     // Record the capture versus replay indices
+    if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) &&
+        g_swapchain_info.find(swapchain) != g_swapchain_info.end())
+    {
+        ToCppSwapchainInfo* swapchain_info     = g_swapchain_info[swapchain];
+        uint32_t            replay_image_index = *replay_index;
+        if (replay_image_index >= static_cast<uint32_t>(swapchain_info->acquired_indices.size()))
+        {
+            swapchain_info->acquired_indices.resize(replay_image_index + 1);
+        }
+
+        swapchain_info->acquired_indices[replay_image_index].index    = captured_index;
+        swapchain_info->acquired_indices[replay_image_index].acquired = true;
+    }
+#endif // USE_VIRTUAL_SWAPCHAIN
+    return result;
+}
+
+VkResult toCppAcquireNextImage2KHR(VkResult                         expected_result,
+                                   VkDevice                         device,
+                                   const VkAcquireNextImageInfoKHR* acquire_info,
+                                   uint32_t                         captured_index,
+                                   uint32_t*                        replay_index)
+{
+    VkResult result = VK_SUCCESS;
+    if (expected_result == VK_SUCCESS)
+    {
+        while ((result = loaded_vkAcquireNextImage2KHR(device, acquire_info, replay_index)) != VK_SUCCESS)
+        {
+            usleep(5000);
+        };
+    }
+    else
+    {
+        result = loaded_vkAcquireNextImage2KHR(device, acquire_info, replay_index);
+    }
+
+#if USE_VIRTUAL_SWAPCHAIN
+    // Record the capture versus replay indices
+    VkSwapchainKHR swapchain = acquire_info->swapchain;
     if ((result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) &&
         g_swapchain_info.find(swapchain) != g_swapchain_info.end())
     {
