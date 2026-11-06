@@ -47,6 +47,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <set>
 #include <map>
 #include <unordered_map>
@@ -216,6 +217,37 @@ struct EventWrapper : public HandleWrapper<VkEvent>
 };
 
 struct DescriptorSetWrapper;
+
+// The descriptor sets bound to a resource. A descriptor write replaces a binding without telling the replaced
+// resource, so a set can stay listed in a resource it no longer binds, and when the set is deleted (pool reset or
+// free) a plain pointer to it would dangle. Each set therefore also lists the bindings it is in, and whichever side is
+// destroyed or cleared first removes itself from the other.
+class DescriptorSetBindings
+{
+  public:
+    DescriptorSetBindings() = default;
+    ~DescriptorSetBindings();
+
+    DescriptorSetBindings(const DescriptorSetBindings&)            = delete;
+    DescriptorSetBindings& operator=(const DescriptorSetBindings&) = delete;
+
+    void insert(DescriptorSetWrapper* set);
+    void clear();
+
+  private:
+    // Both halves of a link are edited together, from resource and descriptor set destruction on any thread, so one
+    // process-wide lock covers every edit. It is never held while taking another lock.
+    static std::mutex& Mutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    friend struct DescriptorSetWrapper;
+    friend void MarkDescriptorSetsDirty(const DescriptorSetBindings& bindings);
+
+    std::unordered_set<DescriptorSetWrapper*> sets_;
+};
 struct AssetWrapperBase
 {
     // device this object was created on
@@ -230,7 +262,7 @@ struct AssetWrapperBase
 
     VkDeviceSize                              size{ 0 };
     bool                                      dirty{ true };
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 };
 
 struct BufferViewWrapper;
@@ -285,7 +317,7 @@ struct ImageWrapper : public HandleWrapper<VkImage>, AssetWrapperBase
 struct SamplerWrapper : public HandleWrapper<VkSampler>
 {
     format::HandleId                          device_id{ format::kNullHandleId };
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 
     // optional opaque descriptor-data used by VK_EXT_descriptor_buffer
     std::vector<uint8_t> opaque_descriptor_data;
@@ -337,7 +369,7 @@ struct BufferViewWrapper : public HandleWrapper<VkBufferView>
         VkDeviceSize            range{ 0 };
     } create_info;
 
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 };
 
 struct ImageViewWrapper : public HandleWrapper<VkImageView>
@@ -356,7 +388,7 @@ struct ImageViewWrapper : public HandleWrapper<VkImageView>
         VkImageSubresourceRange subresource_range{};
     } create_info;
 
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 
     // optional opaque descriptor-data used by VK_EXT_descriptor_buffer
     std::vector<uint8_t> opaque_descriptor_data;
@@ -430,8 +462,27 @@ struct DescriptorSetLayoutWrapper : public HandleWrapper<VkDescriptorSetLayout>
 };
 
 struct DescriptorPoolWrapper;
+
 struct DescriptorSetWrapper : public HandleWrapper<VkDescriptorSet>
 {
+    DescriptorSetWrapper() = default;
+
+    ~DescriptorSetWrapper() { UnbindFromResources(); }
+
+    DescriptorSetWrapper(const DescriptorSetWrapper&)            = delete;
+    DescriptorSetWrapper& operator=(const DescriptorSetWrapper&) = delete;
+
+    // Remove this set from every resource it is bound to.
+    void UnbindFromResources()
+    {
+        std::lock_guard<std::mutex> lock(DescriptorSetBindings::Mutex());
+        for (DescriptorSetBindings* bindings : bound_to)
+        {
+            bindings->sets_.erase(this);
+        }
+        bound_to.clear();
+    }
+
     // Members for general wrapper support.
     // Pool from which set was allocated. The set must be removed from the pool's allocation list when destroyed.
     DescriptorPoolWrapper* parent_pool{ nullptr };
@@ -447,7 +498,43 @@ struct DescriptorSetWrapper : public HandleWrapper<VkDescriptorSet>
     vulkan_state_info::CreateDependencyInfo set_layout_dependency;
 
     bool dirty{ true };
+
+    // The bindings of the resources this set is bound to, the other half of DescriptorSetBindings.
+    std::unordered_set<DescriptorSetBindings*> bound_to;
 };
+
+inline DescriptorSetBindings::~DescriptorSetBindings()
+{
+    clear();
+}
+
+inline void DescriptorSetBindings::insert(DescriptorSetWrapper* set)
+{
+    std::lock_guard<std::mutex> lock(Mutex());
+    if (sets_.insert(set).second)
+    {
+        set->bound_to.insert(this);
+    }
+}
+
+inline void DescriptorSetBindings::clear()
+{
+    std::lock_guard<std::mutex> lock(Mutex());
+    for (DescriptorSetWrapper* set : sets_)
+    {
+        set->bound_to.erase(this);
+    }
+    sets_.clear();
+}
+
+inline void MarkDescriptorSetsDirty(const DescriptorSetBindings& bindings)
+{
+    std::lock_guard<std::mutex> lock(DescriptorSetBindings::Mutex());
+    for (DescriptorSetWrapper* set : bindings.sets_)
+    {
+        set->dirty = true;
+    }
+}
 
 struct DescriptorPoolWrapper : public HandleWrapper<VkDescriptorPool>
 {
@@ -688,7 +775,7 @@ struct AccelerationStructureKHRWrapper : public HandleWrapper<VkAccelerationStru
     VkDeviceSize   size   = 0;
 
     // Only used when tracking
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 
     // optional opaque descriptor-data used by VK_EXT_descriptor_buffer
     std::vector<uint8_t> opaque_descriptor_data;
@@ -696,7 +783,7 @@ struct AccelerationStructureKHRWrapper : public HandleWrapper<VkAccelerationStru
 
 struct AccelerationStructureNVWrapper : public HandleWrapper<VkAccelerationStructureNV>
 {
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 
     // TODO: Determine what additional state tracking is needed.
 };
@@ -724,7 +811,7 @@ struct TensorARMWrapper : public HandleWrapper<VkTensorARM>, AssetWrapperBase
 struct TensorViewARMWrapper : public HandleWrapper<VkTensorViewARM>
 {
     TensorARMWrapper*                         tensor;
-    std::unordered_set<DescriptorSetWrapper*> descriptor_sets_bound_to;
+    DescriptorSetBindings descriptor_sets_bound_to;
 };
 
 struct PipelineCacheWrapper : public HandleWrapper<VkPipelineCache>
