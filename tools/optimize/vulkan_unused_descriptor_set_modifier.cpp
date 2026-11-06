@@ -64,6 +64,7 @@ void VulkanUnusedDescriptorSetModifier::Process_vkAllocateDescriptorSets(const d
     {
         const format::HandleId* sets = args.pDescriptorSets.GetPointer();
         RecordCall(call_info.index, { sets, sets + args.pDescriptorSets.GetLength() });
+        calls_[call_info.index].allocate = true;
     }
 }
 

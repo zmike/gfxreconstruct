@@ -59,6 +59,11 @@ class VulkanUnusedPipelineModifier : public VulkanModifierBase
   public:
     bool CanOptimize() override;
     bool DropsObjects() const override { return true; }
+    void CollectDroppedHandles(std::unordered_set<format::HandleId>& handles) const override
+    {
+        handles.insert(dropped_pipelines_.begin(), dropped_pipelines_.end());
+        handles.insert(dropped_modules_.begin(), dropped_modules_.end());
+    }
 
     void Process_vkCreateGraphicsPipelines(const decode::ApiCallInfo&               call_info,
                                            decode::args::CreateGraphicsPipelines& args) override;

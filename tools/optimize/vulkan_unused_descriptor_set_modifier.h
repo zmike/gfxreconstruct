@@ -53,6 +53,17 @@ class VulkanUnusedDescriptorSetModifier : public VulkanModifierBase
   public:
     bool CanOptimize() override;
     bool DropsObjects() const override { return true; }
+    void CollectDroppedHandles(std::unordered_set<format::HandleId>& handles) const override
+    {
+        for (uint64_t index : dropped_blocks_)
+        {
+            const SetCall& call = calls_.at(index);
+            if (call.allocate)
+            {
+                handles.insert(call.written.begin(), call.written.end());
+            }
+        }
+    }
 
     void Process_vkAllocateDescriptorSets(const decode::ApiCallInfo&            call_info,
                                           decode::args::AllocateDescriptorSets& args) override;
@@ -77,6 +88,7 @@ class VulkanUnusedDescriptorSetModifier : public VulkanModifierBase
     {
         std::vector<format::HandleId> written;
         std::vector<format::HandleId> read;
+        bool                          allocate{ false }; ///< An allocate call: its sets exist only through it.
     };
 
     void RecordCall(uint64_t block_index, std::vector<format::HandleId> written, std::vector<format::HandleId> read = {});

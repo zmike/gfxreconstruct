@@ -25,6 +25,7 @@
 #if defined(GFXRECON_ENABLE_VULKAN)
 // The modifier writes its block through gfxrecon_encode, we need to apply the same guard here
 #include "vulkan_aliasing_group_modifier.h"
+#include "vulkan_dropped_object_name_modifier.h"
 #include "vulkan_unused_descriptor_set_modifier.h"
 #include "vulkan_unused_pipeline_modifier.h"
 #endif
@@ -160,14 +161,24 @@ bool OptimizeVulkanFeature::ScanInput(const std::string&                    inpu
 
     resref_consumer.GetReferencedHandleIds(nullptr, &unreferenced_ids);
 
+    std::unordered_set<format::HandleId> dropped_handles;
     for (auto& candidate : candidates)
     {
         if (candidate->CanOptimize())
         {
             dropped_objects = dropped_objects || candidate->DropsObjects();
+            candidate->CollectDroppedHandles(dropped_handles);
             modifiers.push_back(std::move(candidate));
         }
     }
+
+#if defined(GFXRECON_ENABLE_VULKAN)
+    // Replay never creates a dropped object, so a debug name or tag that names it is a call on an invalid handle.
+    if (!dropped_handles.empty())
+    {
+        modifiers.push_back(std::make_unique<VulkanDroppedObjectNameModifier>(std::move(dropped_handles)));
+    }
+#endif
     return true;
 }
 

@@ -27,6 +27,8 @@
 #include "generated/generated_vulkan_consumer.h"
 #include "call_modifier_base.h"
 
+#include <unordered_set>
+
 GFXRECON_BEGIN_NAMESPACE(gfxrecon)
 
 /**
@@ -40,6 +42,10 @@ class VulkanModifierBase : public decode::VulkanConsumer, public CallModifierBas
     // True if CanOptimize() can drop objects whose other users may then become unreferenced, so the
     // optimizer should scan the result again.
     virtual bool DropsObjects() const { return false; }
+
+    // Adds the handles of objects whose creation this modifier drops, once CanOptimize() has decided.
+    // The optimizer then drops the debug name and tag calls that name them.
+    virtual void CollectDroppedHandles(std::unordered_set<format::HandleId>&) const {}
 };
 
 GFXRECON_END_NAMESPACE(gfxrecon)
