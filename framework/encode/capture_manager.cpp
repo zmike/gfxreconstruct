@@ -1372,6 +1372,12 @@ bool CommonCaptureManager::CreateCaptureFile(format::ApiFamilyId api_family, con
         GFXRECON_LOG_INFO("Recording graphics API capture to %s", capture_filename_.c_str());
         WriteFileHeader();
 
+        // With a deferred trim range the writer was created before the file existed.
+        if (command_writer_ != nullptr)
+        {
+            command_writer_->SetOutputStream(file_stream_.get());
+        }
+
         WriteExeFileInfo(api_family, info);
         capture_file_api_family_ = api_family;
 
@@ -1518,6 +1524,10 @@ void CommonCaptureManager::DeactivateTrimming(std::shared_lock<ApiCallMutexT>& c
         assert(file_stream_);
         file_stream_->Flush();
         file_stream_ = nullptr;
+        if (command_writer_ != nullptr)
+        {
+            command_writer_->SetOutputStream(nullptr);
+        }
         UnlockCaptureFile();
     }
 

@@ -57,6 +57,8 @@ class CommandWriter
                            uint64_t                     p_size,
                            const void*                  p_data);
 
+    void SetOutputStream(util::OutputStream* output_stream) { output_stream_ = output_stream; }
+
   private:
     util::ThreadData*   thread_data_;
     util::OutputStream* output_stream_;
