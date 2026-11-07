@@ -2277,6 +2277,12 @@ void VulkanCaptureManager::PostProcess_vkEnumeratePhysicalDeviceGroups(
 
 void VulkanCaptureManager::ProcessImportFdForBuffer(VkDevice device, VkBuffer buffer, VkDeviceSize memoryOffset)
 {
+    // The capture file does not exist until a trim range starts; the state snapshot covers this resource then.
+    if (!common_manager_->HasCaptureFile())
+    {
+        return;
+    }
+
     auto* device_wrapper = vulkan_wrappers::GetWrapper<vulkan_wrappers::DeviceWrapper>(device);
     auto* buffer_wrapper = vulkan_wrappers::GetWrapper<vulkan_wrappers::BufferWrapper>(buffer);
 
@@ -2313,6 +2319,12 @@ void VulkanCaptureManager::ProcessImportFdForBuffer(VkDevice device, VkBuffer bu
 
 void VulkanCaptureManager::ProcessImportFdForImage(VkDevice device, VkImage image, VkDeviceSize memoryOffset)
 {
+    // The capture file does not exist until a trim range starts; the state snapshot covers this resource then.
+    if (!common_manager_->HasCaptureFile())
+    {
+        return;
+    }
+
     auto* device_wrapper = vulkan_wrappers::GetWrapper<vulkan_wrappers::DeviceWrapper>(device);
     auto* image_wrapper  = vulkan_wrappers::GetWrapper<vulkan_wrappers::ImageWrapper>(image);
 

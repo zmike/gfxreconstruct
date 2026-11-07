@@ -369,6 +369,7 @@ class CommonCaptureManager
     util::ThreadData* GetThreadData();
     bool              IsCaptureModeTrack() const;
     bool              IsCaptureModeWrite() const;
+    bool              HasCaptureFile() const { return file_stream_ != nullptr; }
     bool              IsCaptureModeDisabled() const;
     bool              IsCaptureSkippingCurrentThread() const;
 
