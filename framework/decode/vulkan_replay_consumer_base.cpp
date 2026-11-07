@@ -116,7 +116,9 @@ const std::unordered_map<VkResult, VkResult> kResultValuesAllowedByReplayEnviron
     { VK_SUBOPTIMAL_KHR, VK_SUCCESS },
     { VK_INCOMPLETE, VK_SUCCESS },
     { VK_ERROR_FORMAT_NOT_SUPPORTED, VK_SUCCESS },
-    { VK_ERROR_OUT_OF_POOL_MEMORY, VK_SUCCESS }
+    { VK_ERROR_OUT_OF_POOL_MEMORY, VK_SUCCESS },
+    // a trimmed capture does not carry the swapchain's present timing queue size
+    { VK_SUCCESS, VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT }
 };
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL DebugReportCallback(VkDebugReportFlagsEXT      flags,
