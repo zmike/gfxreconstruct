@@ -2459,6 +2459,15 @@ void VulkanReplayConsumerBase::InitializeResourceAllocator(const VulkanPhysicalD
 // replay must create them. The application callback is not in this process, thus these stubs replace it.
 // Do not use the gfxrecon logging callback here, because it shows all the messages that the application
 // asked for. The messenger that gfxrecon creates for itself continues to log.
+// The RenderDoc capture layer does not support VK_KHR_portability_enumeration. The loader still reports the extension
+// as available, and enabling it with RenderDoc in the chain makes later calls (such as
+// vkGetCalibratedTimestampsKHR) fail intermittently with VK_ERROR_OUT_OF_HOST_MEMORY.
+static bool ReplayLayersRejectPortabilityEnumeration()
+{
+    const std::string layers = util::platform::GetEnv("VK_INSTANCE_LAYERS");
+    return layers.find("VK_LAYER_RENDERDOC_Capture") != std::string::npos;
+}
+
 static VKAPI_ATTR VkBool32 VKAPI_CALL NoopDebugReportCallback(
     VkDebugReportFlagsEXT, VkDebugReportObjectTypeEXT, uint64_t, size_t, int32_t, const char*, const char*, void*)
 {
@@ -3402,8 +3411,9 @@ void VulkanReplayConsumerBase::ModifyCreateInstanceInfo(
             }
         }
 
-        // Always enable portability enumeration if available
-        if (graphics::feature_util::IsSupportedExtension(available_extensions,
+        // Always enable portability enumeration if available, unless a replay layer is known to reject it.
+        if (!ReplayLayersRejectPortabilityEnumeration() &&
+            graphics::feature_util::IsSupportedExtension(available_extensions,
                                                          VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
         {
             if (!graphics::feature_util::IsSupportedExtension(modified_extensions,
